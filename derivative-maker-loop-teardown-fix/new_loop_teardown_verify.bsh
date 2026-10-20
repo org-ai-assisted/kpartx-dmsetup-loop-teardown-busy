@@ -1,0 +1,52 @@
+#!/bin/bash
+# PROPOSED derivative-maker help-steps/misc-helpers.bsh loop_teardown_verify()
+# AFTER the fix: the loop is detached only once no partition map for it remains,
+# so a kpartx -d that loses the udev race (or exits 0 yet leaves a stale map,
+# Debian #891077) can no longer orphan it. Sourceable: defines the function.
+
+loop_teardown_verify() {
+   local image loop_devices_output loop_devices_item attempt losetup_rc base maps
+   image="$1"
+
+   if [ "${image:-}" = "" ]; then
+      return 1
+   fi
+
+   for (( attempt = 0; attempt < 5; attempt++ )); do
+      losetup_rc=0
+      loop_devices_output="$(${SUDO_TO_ROOT} losetup --associated "${image}" --noheadings --output NAME)" || losetup_rc="$?"
+      if [ "${losetup_rc}" != "0" ]; then
+         return 1
+      fi
+      if [ "${loop_devices_output:-}" = "" ]; then
+         return 0
+      fi
+      ## settle first so kpartx -d does not race a udev probe of a partition node
+      ${SUDO_TO_ROOT} udevadm settle --timeout 5 || true
+      while read -r loop_devices_item ; do
+         if [ "${loop_devices_item:-}" = "" ]; then
+            continue
+         fi
+         base="${loop_devices_item##*/}"
+         ${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
+         ## Detach only once no ${base}pN map remains; detaching while one is
+         ## present orphans it (unremovable, "Open count:1"). Repro + fix proof:
+         ## https://github.com/org-ai-assisted/kpartx-dmsetup-loop-teardown-busy
+         maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
+         if [ "${maps:-}" = "" ]; then
+            ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
+         else
+            true "INFO: ${base} partition maps still present; leaving loop attached, will retry."
+         fi
+      done <<< "${loop_devices_output}"
+      ${SUDO_TO_ROOT} udevadm settle --timeout 5 || true
+      sleep 1
+   done
+
+   losetup_rc=0
+   loop_devices_output="$(${SUDO_TO_ROOT} losetup --associated "${image}" --noheadings --output NAME)" || losetup_rc="$?"
+   if [ "${losetup_rc}" != "0" ]; then
+      return 1
+   fi
+   [ "${loop_devices_output:-}" = "" ]
+}

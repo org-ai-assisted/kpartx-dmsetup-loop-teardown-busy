@@ -1,0 +1,40 @@
+#!/bin/bash
+# VERBATIM copy of derivative-maker help-steps/misc-helpers.bsh
+# loop_teardown_verify() BEFORE the fix (the version that orphans a map).
+# Sourceable: defines the function, runs nothing.
+
+loop_teardown_verify() {
+   local image loop_devices_output loop_devices_item attempt losetup_rc
+   image="$1"
+
+   if [ "${image:-}" = "" ]; then
+      return 1
+   fi
+
+   for (( attempt = 0; attempt < 5; attempt++ )); do
+      losetup_rc=0
+      loop_devices_output="$(${SUDO_TO_ROOT} losetup --associated "${image}" --noheadings --output NAME)" || losetup_rc="$?"
+      if [ "${losetup_rc}" != "0" ]; then
+         return 1
+      fi
+      if [ "${loop_devices_output:-}" = "" ]; then
+         return 0
+      fi
+      while read -r loop_devices_item ; do
+         if [ "${loop_devices_item:-}" = "" ]; then
+            continue
+         fi
+         ${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
+         ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
+      done <<< "${loop_devices_output}"
+      ${SUDO_TO_ROOT} udevadm settle --timeout 5 || true
+      sleep 1
+   done
+
+   losetup_rc=0
+   loop_devices_output="$(${SUDO_TO_ROOT} losetup --associated "${image}" --noheadings --output NAME)" || losetup_rc="$?"
+   if [ "${losetup_rc}" != "0" ]; then
+      return 1
+   fi
+   [ "${loop_devices_output:-}" = "" ]
+}

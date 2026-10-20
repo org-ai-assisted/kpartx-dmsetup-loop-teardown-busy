@@ -37,6 +37,7 @@ This repository does three things, per module:
 |---|---|---|
 | [`device-mapper-dmsetup-open-count/`](device-mapper-dmsetup-open-count/) | lvm2 / device-mapper (`dmsetup`) | On a `remove` that fails because the device is open, report the open count and that `--force` cannot remove an open device. Turns a reboot-or-give-up dead end into an actionable one. **Built patched `dmsetup`, before/after included.** |
 | [`multipath-tools-kpartx-udev-lock/`](multipath-tools-kpartx-udev-lock/) | multipath-tools (`kpartx`) | Take the systemd block-device lock (`udevadm lock` / `flock`) around partition add/delete so the teardown does not race `udev`, which is why downstreams wrap `kpartx` in `udevadm settle` retry loops. |
+| [`derivative-maker-loop-teardown-fix/`](derivative-maker-loop-teardown-fix/) | derivative-maker (downstream consumer) | The build-side fix: detach the loop only after its partition maps are gone, so a lost `kpartx -d` race cannot orphan a map. **Deterministic old-vs-new proof** (`prove.sh`) runs the real function bodies and shows OLD orphans / NEW does not. |
 
 See [`docs/investigation.md`](docs/investigation.md) for the full method, the
 device-mapper semantics involved (`dm_lock_for_deletion`), and the environments
