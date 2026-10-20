@@ -4,9 +4,10 @@
 # so a TRANSIENT opener looks like a device that needs a reboot. Also shows that
 # `remove --force` only loads the error target -- it cannot remove an open device.
 #
-# Portable: needs only util-linux (losetup), multipath-tools (kpartx) and
-# device-mapper (dmsetup). Run as root. Self-cleaning. Touches only a loop device
-# backed by a throwaway image under a mktemp dir -- no existing device is affected.
+# Portable: needs util-linux (losetup), multipath-tools (kpartx), device-mapper
+# (dmsetup) and gdisk (sgdisk). Run as root. Self-cleaning. Touches only a loop
+# device backed by a throwaway image under a mktemp dir -- no existing device is
+# affected.
 #
 # Exit 0 = the issue reproduced (remove failed busy while the device was open).
 set -u
@@ -17,7 +18,7 @@ for t in losetup kpartx dmsetup sgdisk; do
 done
 [ "$(id -u)" -eq 0 ] || fail "run as root (loop + device-mapper setup needs it)"
 
-work="$(mktemp -d)"
+work="$(mktemp -d)" || fail "mktemp -d failed"
 img="$work/disk.img"
 loop=""
 holder=""
@@ -45,6 +46,10 @@ udevadm settle --timeout 5 2>/dev/null || true
 # could pick a foreign build's map on a busy host and destroy it below.
 part="$(basename "$loop")p1"
 dmsetup info "$part" >/dev/null 2>&1 || fail "kpartx created no map $part (check loop/kpartx)"
+# Defence in depth: refuse to touch it unless it is actually backed by OUR loop,
+# so a stale same-named map from a crashed run can never be removed by mistake.
+dmsetup deps -o devname "$part" 2>/dev/null | grep -qw "($(basename "$loop"))" \
+	|| fail "map $part is not backed by $loop -- refusing to touch it"
 node="/dev/mapper/$part"
 
 # Hold the partition map open from a background process. This stands in for the
@@ -74,16 +79,30 @@ dmsetup remove --force "$part"; rcf=$?
 echo "   (exit $rcf)"
 echo "   table now:   $(dmsetup table "$part" 2>/dev/null)"
 echo "   still here:  $(dmsetup info -c -o name,open,segments "$part" 2>/dev/null | tail -1)"
+# capture the post-force state for the success assertion: the map must still
+# exist AND still be open (proving --force did not remove it).
+force_open="$(dmsetup info -c --noheadings -o open "$part" 2>/dev/null || true)"
 echo
 echo "4) No reboot is needed: once the holder closes, remove succeeds."
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; holder=""
 sleep 0.3
 echo "   \$ dmsetup remove $part"
 if dmsetup remove "$part"; then
+	final_ok=1
 	echo "   -> removed cleanly (open count reached 0, no reboot)"
 else
+	final_ok=0
 	echo "   -> unexpected: still failed (investigate a genuine leak)"
 fi
 echo "========================================================================"
-echo "REPRODUCED: the busy error gave no open count and no holder; --force could"
-echo "not remove the open device; release came from the opener closing, not a reboot."
+# Claim success only if the behaviour actually matched: the plain remove failed
+# (busy), --force left the map present AND still open (did not remove it), and
+# removal succeeded once the holder closed.
+if [ "$rc" -ne 0 ] && [ "$rcf" -ne 0 ] && [ "${force_open:-0}" -gt 0 ] && [ "$final_ok" -eq 1 ]; then
+	echo "REPRODUCED: the busy error gave no open count; --force could not remove the"
+	echo "open device; release came from the opener closing, not a reboot."
+else
+	echo "NOT REPRODUCED as expected (plain-remove rc=$rc, --force rc=$rcf," \
+	     "open-after-force=${force_open:-0}, post-close removal ok=$final_ok)."
+	exit 1
+fi
