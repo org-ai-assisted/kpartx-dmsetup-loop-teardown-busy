@@ -20,3 +20,10 @@ $ dmsetup table loop0p1 ; dmsetup info -c -o name,open,segments loop0p1
 0 16384 error
 Name             Open Targ
 loop0p1             1    1
+
+##### BEFORE (stock): 'remove --deferred' of an OPEN map (succeeds, no error) #####
+$ dmsetup remove --deferred loop0p1
+(exit 0)
+# device stays present (deferred removal armed for last close):
+Name             Open
+loop0p1             1

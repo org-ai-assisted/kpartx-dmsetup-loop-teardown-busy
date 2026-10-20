@@ -42,10 +42,11 @@ limitation, and that removal succeeds the moment the holder closes -- no reboot.
 
 ## The fix
 
-`dmsetup-open-count.patch` (against lvm2 git). After a remove attempt, if the
-device is still present and open, print the open count plus guidance. It
-self-guards on `info.exists && info.open_count > 0`, so it is silent on a clean
-remove, and it costs one extra `DM_DEVICE_INFO` ioctl only on the failure path.
+`dmsetup-open-count.patch` (against lvm2 git). Only when the remove **fails**
+(`!r`), and the device is still present and open, print the open count plus
+guidance. Gating on the failure path means a successful `remove --deferred` (which
+deliberately leaves the device present and open) is NOT mislabelled "blocked", and
+the extra `DM_DEVICE_INFO` ioctl runs only on failure.
 
 ## Evidence (built patched binary)
 

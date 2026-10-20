@@ -1,5 +1,5 @@
 diff --git a/libdm/dm-tools/dmsetup.c b/libdm/dm-tools/dmsetup.c
-index 1ddc9e8..5958e41 100644
+index 1ddc9e8..40d27c3 100644
 --- a/libdm/dm-tools/dmsetup.c
 +++ b/libdm/dm-tools/dmsetup.c
 @@ -2276,8 +2276,40 @@ bad:
@@ -7,11 +7,11 @@ index 1ddc9e8..5958e41 100644
  }
 
 +/*
-+ * After a remove attempt, a device that is still present and open is the common
-+ * "Device or resource busy" case.  The bare ioctl error carries no open count
-+ * and no holder, so a TRANSIENT opener is mistaken for a device that needs a
-+ * reboot.  Report the open count and how to clear it.  Self-guards: logs only
-+ * when the device is still present and open, so it is silent on a clean remove.
++ * A remove that fails because the device is still open is the common
++ * "Device or resource busy" case.  The bare ioctl error carries no open
++ * count and no holder, so a TRANSIENT opener is mistaken for a device that
++ * needs a reboot.  Report the open count and how to clear it.  Self-guards:
++ * logs only when the device is still present and open.
 + */
 +static void _explain_remove_busy(const char *name)
 +{
@@ -43,14 +43,17 @@ index 1ddc9e8..5958e41 100644
  	if (_switches[FORCE_ARG] && argc) {
  		/*
  		 * 'remove --force' option is doing 2 operations on the same device
-@@ -2289,7 +2321,11 @@ static int _remove(CMD_ARGS)
+@@ -2289,7 +2321,14 @@ static int _remove(CMD_ARGS)
  		(void) _error_device(cmd, NULL, argc, argv, NULL, 0);
  	}
 
 -	return _simple(DM_DEVICE_REMOVE, argc ? argv[0] : NULL, 0, 0);
 +	r = _simple(DM_DEVICE_REMOVE, argc ? argv[0] : NULL, 0, 0);
 +
-+	_explain_remove_busy(argc ? argv[0] : NULL);
++	/* Only on the failure path: a successful remove (incl. --deferred, which
++	 * succeeds and leaves the device present) must not look "blocked". */
++	if (!r)
++		_explain_remove_busy(argc ? argv[0] : NULL);
 +
 +	return r;
  }

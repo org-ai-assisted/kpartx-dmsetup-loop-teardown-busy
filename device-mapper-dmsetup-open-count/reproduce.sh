@@ -41,15 +41,18 @@ loop="$(losetup --find --show "$img")"
 kpartx -a -s -- "$loop" >/dev/null 2>&1
 udevadm settle --timeout 5 2>/dev/null || true
 
-part="$(dmsetup ls --noheadings 2>/dev/null | awk '{print $1}' \
-        | grep -E '^loop[0-9]+p1$' | head -1)"
-[ -n "$part" ] || fail "kpartx created no partition map (check loop/kpartx)"
+# Scope the match to OUR loop ("loopN" -> "loopNp1"); a bare ^loop[0-9]+p1$
+# could pick a foreign build's map on a busy host and destroy it below.
+part="$(basename "$loop")p1"
+dmsetup info "$part" >/dev/null 2>&1 || fail "kpartx created no map $part (check loop/kpartx)"
 node="/dev/mapper/$part"
 
 # Hold the partition map open from a background process. This stands in for the
 # REAL transient holder seen in the field (a udev/blkid worker, a systemd
 # auto-activation, a probe in another mount namespace) -- the point is only that
 # open count > 0 at teardown time.
+# shellcheck disable=SC2217  # the redirect exists to HOLD $node open for sleep's
+# lifetime (open count +1); sleep is only the timer, it is not meant to read it.
 sleep 600 < "$node" &
 holder=$!
 sleep 0.3

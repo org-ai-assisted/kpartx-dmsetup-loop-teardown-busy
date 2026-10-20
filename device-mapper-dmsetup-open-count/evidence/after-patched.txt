@@ -14,3 +14,10 @@ Command failed.
 # device still present AND open after --force:
 Name             Open Targ
 loop0p1             1    1
+
+##### AFTER (patched): 'remove --deferred' of an OPEN map -- must NOT false-error #####
+$ dmsetup remove --deferred loop0p1
+(exit 0)
+# patched is silent here (remove --deferred SUCCEEDS; the hint is failure-path only):
+Name             Open
+loop0p1             1
