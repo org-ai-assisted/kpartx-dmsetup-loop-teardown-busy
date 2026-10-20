@@ -43,11 +43,14 @@ Reproduced in a sandbox VM. Kernel 6.18.55 (also cross-checked against the field
 host's 6.12.111); util-linux 2.41.5; multipath-tools 0.11.1; libdevmapper
 1.02.205; loop `max_part = 0`.
 
-1. **Holder detection is reliable.** A canary that holds a partition map open from
-   a known process: `dmsetup remove` -> `EBUSY`, and an exhaustive hunt (lsof +
-   fuser + every `/proc/[pid]/fd` and task fd matched by dm `major:minor` + mount
-   scan across all namespaces + dm deps + nested loop) found the holder every
-   time. So a real open reference is always findable with the right probe.
+1. **Holder detection found the canary every time (tested).** A canary that holds
+   a partition map open from a known process: `dmsetup remove` -> `EBUSY`, and an
+   exhaustive hunt (lsof + fuser + every `/proc/[pid]/fd` and task fd matched by dm
+   `major:minor` + mount scan across all namespaces + dm deps + nested loop) found
+   the holder on every trial. This shows the probe works against a real opener; it
+   does not prove every conceivable open reference is findable, so a genuine "no
+   holder" at the `EBUSY` instant would be an anomaly worth capturing (see the
+   exclusion doc), not the expected case.
 
 2. **The force matrix (core result).** With a genuine opener holding the map,
    every non-reboot method fails `EBUSY`: `remove`, `remove --retry` (same ioctl

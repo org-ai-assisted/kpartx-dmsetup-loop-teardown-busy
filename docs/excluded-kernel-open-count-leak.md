@@ -11,12 +11,13 @@ and the direct evidence points the other way:
 - **Not reproduced.** 0 stuck maps across 390 teardown attempts on current kernels
   (40 build-order `kpartx -d; losetup --detach`; 200 sync + 150 nosync direct
   `dmsetup remove` immediately after `kpartx -a`).
-- **Holder detection is reliable.** When a map is open, the holder is always
-  findable by probing `/proc/[pid]/fd` by dm `major:minor` (plus lsof/fuser, mount
-  namespaces, dm deps, nested loop). A reported "no holder" is far more likely a
-  holder that exited between the `EBUSY` and the `lsof`, or a holder class the
-  check did not cover at that instant (swap, another mount namespace), than a
-  nonexistent one.
+- **Holder detection found the holder in every trial.** In the canary trials, a
+  map held open was always located by probing `/proc/[pid]/fd` by dm `major:minor`
+  (plus lsof/fuser, mount namespaces, dm deps, nested loop). So a reported "no
+  holder" is more likely a holder that exited between the `EBUSY` and the `lsof`,
+  or a holder class the check did not cover at that instant (swap, another mount
+  namespace), than a nonexistent one -- but the probe passing on the canary does
+  not by itself rule out a kernel leak; only a same-instant capture (below) can.
 - **The field instance self-cleared.** It was gone on first inspection with no
   reboot (host uptime continuous) and no destructive command issued. A genuine
   permanent leak would not self-clear.

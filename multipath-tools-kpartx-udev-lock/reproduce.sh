@@ -17,7 +17,7 @@ for t in losetup kpartx dmsetup sgdisk flock timeout; do
 done
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 
-work="$(mktemp -d)"
+work="$(mktemp -d)" || fail "mktemp -d failed"
 img="$work/disk.img"
 loop=""
 obs=""

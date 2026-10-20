@@ -31,7 +31,10 @@ Two specific traps the current output does not dispel:
 - `remove --force` does **not** force removal of an open device. It only loads the
   `error` target; the device stays present and open (see `evidence/before-stock.txt`:
   table becomes `0 ... error`, `Open 1`).
-- `remove --deferred` cannot fire while the device is open.
+- `remove --deferred` is accepted (it does not fail), but the removal only
+  completes once the last opener closes -- so on its own it does not make the
+  device go away now, and the bare EBUSY from a plain remove never points the
+  operator at it.
 
 ## The reproducer
 
@@ -43,10 +46,24 @@ limitation, and that removal succeeds the moment the holder closes -- no reboot.
 ## The fix
 
 `dmsetup-open-count.patch` (against lvm2 git). Only when the remove **fails**
-(`!r`), and the device is still present and open, print the open count plus
-guidance. Gating on the failure path means a successful `remove --deferred` (which
-deliberately leaves the device present and open) is NOT mislabelled "blocked", and
-the extra `DM_DEVICE_INFO` ioctl runs only on failure.
+(`!r`) and the device is still present and open, print the open count and point at
+the holder. It reuses lvm2's own in-tree conventions rather than reinventing:
+
+- resolves the device via `_set_task_device` (so it covers removal by name,
+  `--uuid`, or `--major`+`--minor`) and reads the name back with
+  `dm_task_get_name()` (as `_status` does);
+- reports `info.open_count`, and -- mirroring `lv_check_not_in_use()` -- uses
+  `dm_device_has_holders()` to distinguish a **stacked block-device** holder
+  (nameable via `/sys/dev/block/M:m/holders`) from an opener with **no** block
+  holder (a process fd, a mount in any namespace, or swap -- the field case),
+  tailoring the guidance accordingly;
+- gating on `!r` means a successful `remove --deferred` (which deliberately leaves
+  the device present and open) is NOT mislabelled "blocked", and the extra
+  `DM_DEVICE_INFO` ioctl runs only on the failure path.
+
+(The lsof/fuser hint is the secondary human tip for the no-block-holder case;
+util-linux dropped its own lsof/fuser `umount` hint in 2.23, so the primary signal
+here is the structured open-count + holders, matching the modern dm idiom.)
 
 ## Evidence (built patched binary)
 
@@ -58,21 +75,29 @@ device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
 Command failed.
 ```
 
-After (patched) -- `evidence/after-patched.txt`:
+After (patched) -- `evidence/after-patched.txt`. No block-device holder (a process
+fd holds it -- the field case):
 
 ```
 $ dmsetup remove loop0p1
 device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
-device-mapper: remove of loop0p1 is blocked: device is still open (open count 1).
-Find and close the holder (lsof/fuser /dev/mapper/loop0p1; check mounts in every
-mount namespace, a nested loop/dm device, and swap), then retry. 'remove --force'
-only replaces the table with the error target and cannot remove an open device;
-'remove --deferred' removes it automatically once the last opener closes.
-Command failed.
+device-mapper: remove of loop0p1 is blocked: still open (open count 1) with no
+block-device holder -- an opener (a process fd, a mount in any namespace, or swap)
+holds it. Close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo
+across namespaces), then retry; or use 'remove --deferred' to remove on last close.
+'remove --force' only loads the error target and cannot remove an open device.
 ```
 
-The patched message fires on plain `remove` and on `remove --force`
-(`evidence/after-patched.txt`), and `evidence/selfheal.txt` shows the device is
+Stacked block-device holder (the holders branch):
+
+```
+$ dmsetup remove loop0p1
+device-mapper: remove of loop0p1 is blocked: still open (open count 1) by a stacked
+block device -- see /sys/dev/block/252:0/holders; remove the holder first.
+```
+
+The message fires on plain `remove` and `remove --force`, stays silent on a
+successful `remove --deferred`, and `evidence/selfheal.txt` shows the device is
 removable the instant the holder closes -- confirming the condition is transient,
 not reboot-only. Exact versions are in `evidence/versions.txt`.
 

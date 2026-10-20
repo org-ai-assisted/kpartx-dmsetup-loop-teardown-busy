@@ -1,37 +1,55 @@
 diff --git a/libdm/dm-tools/dmsetup.c b/libdm/dm-tools/dmsetup.c
-index 1ddc9e8..40d27c3 100644
+index 1ddc9e8..4c8e7fb 100644
 --- a/libdm/dm-tools/dmsetup.c
 +++ b/libdm/dm-tools/dmsetup.c
-@@ -2276,8 +2276,40 @@ bad:
+@@ -2276,8 +2276,58 @@ bad:
  	return r;
  }
 
 +/*
 + * A remove that fails because the device is still open is the common
 + * "Device or resource busy" case.  The bare ioctl error carries no open
-+ * count and no holder, so a TRANSIENT opener is mistaken for a device that
-+ * needs a reboot.  Report the open count and how to clear it.  Self-guards:
-+ * logs only when the device is still present and open.
++ * count and no holder, so a transient opener looks like a device that needs
++ * a reboot.  Report the open count and, mirroring lv_check_not_in_use(),
++ * distinguish a stacked block-device holder (nameable via sysfs) from an
++ * opener with no block holder (a process fd, a mount in any namespace, or
++ * swap).  Resolves the name via dm_task_get_name() so it also covers removal
++ * by --uuid / --major+--minor.  Self-guards: logs only when the device is
++ * still present and open.
 + */
 +static void _explain_remove_busy(const char *name)
 +{
 +	struct dm_task *dmt;
 +	struct dm_info info;
++	const char *dname;
 +
-+	if (!name || !(dmt = dm_task_create(DM_DEVICE_INFO)))
++	if (!(dmt = dm_task_create(DM_DEVICE_INFO)))
 +		return;
 +
-+	if (_set_task_device(dmt, name, 0) &&
++	/* optional=1: the remove already reported a no-selector case, so stay
++	 * silent here rather than repeat "No device specified". */
++	if (_set_task_device(dmt, name, 1) &&
 +	    dm_task_run(dmt) &&
 +	    dm_task_get_info(dmt, &info) &&
-+	    info.exists && info.open_count > 0)
-+		log_error("device-mapper: remove of %s is blocked: device is still "
-+			  "open (open count %d). Find and close the holder (lsof/fuser "
-+			  "/dev/mapper/%s; check mounts in every mount namespace, a nested "
-+			  "loop/dm device, and swap), then retry. 'remove --force' only "
-+			  "replaces the table with the error target and cannot remove an "
-+			  "open device; 'remove --deferred' removes it automatically once "
-+			  "the last opener closes.", name, info.open_count, name);
++	    info.exists && info.open_count > 0) {
++		if (!(dname = dm_task_get_name(dmt)) || !*dname)
++			dname = name ? name : "device";
++
++		if (dm_device_has_holders(info.major, info.minor))
++			log_error("device-mapper: remove of %s is blocked: still open "
++				  "(open count %d) by a stacked block device -- see "
++				  "/sys/dev/block/%u:%u/holders; remove the holder first.",
++				  dname, info.open_count, info.major, info.minor);
++		else
++			log_error("device-mapper: remove of %s is blocked: still open "
++				  "(open count %d) with no block-device holder -- an opener "
++				  "(a process fd, a mount in any namespace, or swap) holds it. "
++				  "Close it (fuser/lsof the node; scan /proc/*/fd and "
++				  "/proc/*/mountinfo across namespaces), then retry; or use "
++				  "'remove --deferred' to remove on last close. 'remove --force' "
++				  "only loads the error target and cannot remove an open device.",
++				  dname, info.open_count);
++	}
 +
 +	dm_task_destroy(dmt);
 +}
@@ -43,7 +61,7 @@ index 1ddc9e8..40d27c3 100644
  	if (_switches[FORCE_ARG] && argc) {
  		/*
  		 * 'remove --force' option is doing 2 operations on the same device
-@@ -2289,7 +2321,14 @@ static int _remove(CMD_ARGS)
+@@ -2289,7 +2339,14 @@ static int _remove(CMD_ARGS)
  		(void) _error_device(cmd, NULL, argc, argv, NULL, 0);
  	}
 
