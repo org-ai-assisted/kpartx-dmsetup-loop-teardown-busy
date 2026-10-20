@@ -81,11 +81,12 @@ fd holds it -- the field case):
 ```
 $ dmsetup remove loop0p1
 device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
-device-mapper: remove of loop0p1 is blocked: still open (open count 1) with no
-block-device holder -- an opener (a process fd, a mount in any namespace, or swap)
-holds it. Close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo
-across namespaces), then retry; or use 'remove --deferred' to remove on last close.
-'remove --force' only loads the error target and cannot remove an open device.
+device-mapper: remove of loop0p1 is blocked: still open (open count 1). No stacked
+block-device holder was found in /sys/dev/block/252:0/holders, so the opener is most
+likely a process fd, a mount in any namespace, or swap -- close it (fuser/lsof the
+node; scan /proc/*/fd and /proc/*/mountinfo across namespaces), then retry; or use
+'remove --deferred' to remove on last close. 'remove --force' only loads the error
+target and cannot remove an open device.
 ```
 
 Stacked block-device holder (the holders branch):
