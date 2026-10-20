@@ -20,7 +20,8 @@ Command failed.
 That is the kernel's correct `dm_lock_for_deletion()` guard (open count > 0), but
 the tool surfaces **none** of the actionable detail it already has one subcommand
 away (`dmsetup info -c -o open` shows the count). With no open count and no holder
-in the error, and with `--force` / `--retry` / `--deferred` all still failing, the
+in the error, `--force` and `--retry` still failing, and `--deferred` only
+deferring the removal (not completing it while the device is open), the
 operator's natural conclusion is "this device is wedged, reboot the host" -- when
 in reality the open count is almost always a **transient** holder (a `udev`/`blkid`
 worker, a `systemd` auto-activation, a probe in another mount namespace) that will
