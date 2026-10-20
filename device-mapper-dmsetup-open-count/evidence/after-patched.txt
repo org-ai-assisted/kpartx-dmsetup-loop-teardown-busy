@@ -1,0 +1,23 @@
+##### AFTER (patched dmsetup): plain 'remove' of an OPEN map #####
+$ dmsetup remove loop0p1
+device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
+device-mapper: remove of loop0p1 is blocked: device is still open (open count 1). Find and close the holder (lsof/fuser /dev/mapper/loop0p1; check mounts in every mount namespace, a nested loop/dm device, and swap), then retry. 'remove --force' only replaces the table with the error target and cannot remove an open device; 'remove --deferred' removes it automatically once the last opener closes.
+Command failed.
+(exit 1)
+
+##### AFTER: 'remove --force' of an OPEN map #####
+$ dmsetup remove --force loop0p1
+device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
+device-mapper: remove of loop0p1 is blocked: device is still open (open count 1). Find and close the holder (lsof/fuser /dev/mapper/loop0p1; check mounts in every mount namespace, a nested loop/dm device, and swap), then retry. 'remove --force' only replaces the table with the error target and cannot remove an open device; 'remove --deferred' removes it automatically once the last opener closes.
+Command failed.
+(exit 1)
+# device still present AND open after --force:
+Name             Open Targ
+loop0p1             1    1
+
+##### AFTER (patched): 'remove --deferred' of an OPEN map -- must NOT false-error #####
+$ dmsetup remove --deferred loop0p1
+(exit 0)
+# patched is silent here (remove --deferred SUCCEEDS; the hint is failure-path only):
+Name             Open
+loop0p1             1

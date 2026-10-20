@@ -1,0 +1,10 @@
+##### SELF-HEAL: patched 'remove' succeeds once the holder closes (no reboot) #####
+# holder open -> blocked:
+$ dmsetup remove loop0p1
+device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
+device-mapper: remove of loop0p1 is blocked: device is still open (open count 1). Find and close the holder (lsof/fuser /dev/mapper/loop0p1; check mounts in every mount namespace, a nested loop/dm device, and swap), then retry. 'remove --force' only replaces the table with the error target and cannot remove an open device; 'remove --deferred' removes it automatically once the last opener closes.
+Command failed.
+(exit 1)
+# close the holder, then retry:
+$ dmsetup remove loop0p1
+-> REMOVED (open count reached 0, NO reboot)

@@ -1,0 +1,61 @@
+diff --git a/libdm/dm-tools/dmsetup.c b/libdm/dm-tools/dmsetup.c
+index 1ddc9e8..40d27c3 100644
+--- a/libdm/dm-tools/dmsetup.c
++++ b/libdm/dm-tools/dmsetup.c
+@@ -2276,8 +2276,40 @@ bad:
+ 	return r;
+ }
+
++/*
++ * A remove that fails because the device is still open is the common
++ * "Device or resource busy" case.  The bare ioctl error carries no open
++ * count and no holder, so a TRANSIENT opener is mistaken for a device that
++ * needs a reboot.  Report the open count and how to clear it.  Self-guards:
++ * logs only when the device is still present and open.
++ */
++static void _explain_remove_busy(const char *name)
++{
++	struct dm_task *dmt;
++	struct dm_info info;
++
++	if (!name || !(dmt = dm_task_create(DM_DEVICE_INFO)))
++		return;
++
++	if (_set_task_device(dmt, name, 0) &&
++	    dm_task_run(dmt) &&
++	    dm_task_get_info(dmt, &info) &&
++	    info.exists && info.open_count > 0)
++		log_error("device-mapper: remove of %s is blocked: device is still "
++			  "open (open count %d). Find and close the holder (lsof/fuser "
++			  "/dev/mapper/%s; check mounts in every mount namespace, a nested "
++			  "loop/dm device, and swap), then retry. 'remove --force' only "
++			  "replaces the table with the error target and cannot remove an "
++			  "open device; 'remove --deferred' removes it automatically once "
++			  "the last opener closes.", name, info.open_count, name);
++
++	dm_task_destroy(dmt);
++}
++
+ static int _remove(CMD_ARGS)
+ {
++	int r;
++
+ 	if (_switches[FORCE_ARG] && argc) {
+ 		/*
+ 		 * 'remove --force' option is doing 2 operations on the same device
+@@ -2289,7 +2321,14 @@ static int _remove(CMD_ARGS)
+ 		(void) _error_device(cmd, NULL, argc, argv, NULL, 0);
+ 	}
+
+-	return _simple(DM_DEVICE_REMOVE, argc ? argv[0] : NULL, 0, 0);
++	r = _simple(DM_DEVICE_REMOVE, argc ? argv[0] : NULL, 0, 0);
++
++	/* Only on the failure path: a successful remove (incl. --deferred, which
++	 * succeeds and leaves the device present) must not look "blocked". */
++	if (!r)
++		_explain_remove_busy(argc ? argv[0] : NULL);
++
++	return r;
+ }
+
+ static int _count_devices(CMD_ARGS)

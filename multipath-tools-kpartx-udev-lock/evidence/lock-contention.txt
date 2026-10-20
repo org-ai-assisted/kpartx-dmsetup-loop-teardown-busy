@@ -1,0 +1,19 @@
+whole-disk device under test: /dev/loop0
+kernel: 6.18.55-1.qubes.fc41.x86_64
+
+### Sub-test 1: PATCHED kpartx RESPECTS the whole-disk lock ###
+  observer holds flock(LOCK_EX) on /dev/loop0 (a conflicting non-blocking lock attempt fails -- good)
+  $ timeout 3 kpartx(patched) -a -s /dev/loop0   # should BLOCK on the lock
+  -> exit 124  (TIMED OUT = blocked waiting for the lock)
+  -> maps created while blocked: []  (empty = it waited, created nothing)
+  release the observer; the same command now completes:
+  -> after release, kpartx(patched) -a exit 0  ; maps: [loop0p1 loop0p2 ]
+
+### Sub-test 2: BASELINE kpartx IGNORES the whole-disk lock (the race) ###
+  observer holds flock(LOCK_EX) on /dev/loop0
+  $ timeout 3 kpartx(baseline) -a -s /dev/loop0   # proceeds despite the lock
+  -> exit 0  (completed = lock ignored)
+  -> maps created while the disk was locked: [loop0p1 loop0p2 ]  (non-empty = raced the lock holder)
+
+CONCLUSION: patched kpartx waits for the whole-disk lock (so udev, which takes a
+shared lock before probing, defers instead of racing); baseline kpartx ignores it.

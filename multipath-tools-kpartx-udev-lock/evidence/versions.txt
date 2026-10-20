@@ -1,0 +1,3 @@
+multipath-tools (patched + baseline built from git): 0.15.1
+stock distro multipath-tools for reference: 0.11.1 (also has no flock)
+kernel: 6.18.55-1.qubes.fc41.x86_64
