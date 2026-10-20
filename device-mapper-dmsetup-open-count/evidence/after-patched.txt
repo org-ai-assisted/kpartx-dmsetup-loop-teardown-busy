@@ -1,14 +1,14 @@
 ##### AFTER (patched dmsetup): plain 'remove' of an OPEN map #####
 $ dmsetup remove loop0p1
 device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
-device-mapper: remove of loop0p1 is blocked: still open (open count 1) with no block-device holder -- an opener (a process fd, a mount in any namespace, or swap) holds it. Close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo across namespaces), then retry; or use 'remove --deferred' to remove on last close. 'remove --force' only loads the error target and cannot remove an open device.
+device-mapper: remove of loop0p1 is blocked: still open (open count 1). No stacked block-device holder was found in /sys/dev/block/252:0/holders, so the opener is most likely a process fd, a mount in any namespace, or swap -- close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo across namespaces), then retry; or use 'remove --deferred' to remove on last close. 'remove --force' only loads the error target and cannot remove an open device.
 Command failed.
 (exit 1)
 
 ##### AFTER: 'remove --force' of an OPEN map #####
 $ dmsetup remove --force loop0p1
 device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
-device-mapper: remove of loop0p1 is blocked: still open (open count 1) with no block-device holder -- an opener (a process fd, a mount in any namespace, or swap) holds it. Close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo across namespaces), then retry; or use 'remove --deferred' to remove on last close. 'remove --force' only loads the error target and cannot remove an open device.
+device-mapper: remove of loop0p1 is blocked: still open (open count 1). No stacked block-device holder was found in /sys/dev/block/252:0/holders, so the opener is most likely a process fd, a mount in any namespace, or swap -- close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo across namespaces), then retry; or use 'remove --deferred' to remove on last close. 'remove --force' only loads the error target and cannot remove an open device.
 Command failed.
 (exit 1)
 # device still present AND open after --force:

@@ -20,7 +20,8 @@ Command failed.
 That is the kernel's correct `dm_lock_for_deletion()` guard (open count > 0), but
 the tool surfaces **none** of the actionable detail it already has one subcommand
 away (`dmsetup info -c -o open` shows the count). With no open count and no holder
-in the error, and with `--force` / `--retry` / `--deferred` all still failing, the
+in the error, `--force` and `--retry` still failing, and `--deferred` only
+deferring the removal (not completing it while the device is open), the
 operator's natural conclusion is "this device is wedged, reboot the host" -- when
 in reality the open count is almost always a **transient** holder (a `udev`/`blkid`
 worker, a `systemd` auto-activation, a probe in another mount namespace) that will
@@ -81,11 +82,12 @@ fd holds it -- the field case):
 ```
 $ dmsetup remove loop0p1
 device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
-device-mapper: remove of loop0p1 is blocked: still open (open count 1) with no
-block-device holder -- an opener (a process fd, a mount in any namespace, or swap)
-holds it. Close it (fuser/lsof the node; scan /proc/*/fd and /proc/*/mountinfo
-across namespaces), then retry; or use 'remove --deferred' to remove on last close.
-'remove --force' only loads the error target and cannot remove an open device.
+device-mapper: remove of loop0p1 is blocked: still open (open count 1). No stacked
+block-device holder was found in /sys/dev/block/252:0/holders, so the opener is most
+likely a process fd, a mount in any namespace, or swap -- close it (fuser/lsof the
+node; scan /proc/*/fd and /proc/*/mountinfo across namespaces), then retry; or use
+'remove --deferred' to remove on last close. 'remove --force' only loads the error
+target and cannot remove an open device.
 ```
 
 Stacked block-device holder (the holders branch):
