@@ -1,0 +1,22 @@
+##### BEFORE (stock dmsetup): plain 'remove' of an OPEN map #####
+# the open count IS available one subcommand away:
+$ dmsetup info -c -o name,open loop0p1
+Name             Open
+loop0p1             1
+
+# but 'remove' hides it -- bare EBUSY, no count, no holder:
+$ dmsetup remove loop0p1
+device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
+Command failed.
+(exit 1)
+
+##### BEFORE: 'remove --force' of an OPEN map (does NOT force-remove) #####
+$ dmsetup remove --force loop0p1
+device-mapper: remove ioctl on loop0p1  failed: Device or resource busy
+Command failed.
+(exit 1)
+# table AFTER --force -> error target; device still present AND still open:
+$ dmsetup table loop0p1 ; dmsetup info -c -o name,open,segments loop0p1
+0 16384 error
+Name             Open Targ
+loop0p1             1    1

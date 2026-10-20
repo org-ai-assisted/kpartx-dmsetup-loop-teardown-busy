@@ -1,0 +1,4 @@
+built from lvm2 git: 2.03.44(2)-git (2026-09-30)
+Library version:   1.02.218-git (2026-09-30)
+Driver version:    4.50.0
+kernel: 6.18.55-1.qubes.fc41.x86_64
