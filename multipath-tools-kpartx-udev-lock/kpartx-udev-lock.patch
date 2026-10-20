@@ -1,0 +1,32 @@
+diff --git a/kpartx/kpartx.c b/kpartx/kpartx.c
+index 370d09a..1190d08 100644
+--- a/kpartx/kpartx.c
++++ b/kpartx/kpartx.c
+@@ -34,6 +34,7 @@
+ #include <ctype.h>
+ #include <libdevmapper.h>
+
++#include <sys/file.h>
+ #include "autoconfig.h"
+ #include "devmapper.h"
+ #include "crc32.h"
+@@ -371,6 +372,19 @@ main(int argc, char **argv){
+ 		exit(1);
+ 	}
+
++	/*
++	 * Hold the exclusive BSD lock on the whole-disk device while partition
++	 * maps are added or removed, per the systemd block-device locking
++	 * protocol: udev takes a shared lock before probing a device, so holding
++	 * LOCK_EX here makes udev defer instead of racing kpartx.  A udev/blkid
++	 * probe that opens a partition during teardown is exactly what leaves a
++	 * partition map busy or stale.  Released implicitly when fd is closed.
++	 * Best-effort: never fail kpartx on a backend that does not support it.
++	 */
++	if (what != LIST && flock(fd, LOCK_EX) < 0)
++		fprintf(stderr, "%s: warning: could not take block-device lock: %s\n",
++			device, strerror(errno));
++
+ 	for (i = 0; i < ptct; i++) {
+ 		ptp = &pts[i];
+
