@@ -1,133 +1,96 @@
-# derivative-maker loop teardown fix: three generations, proven
+# derivative-maker loop teardown fix: four generations, proven
 
-The build-side counterpart to this repo's upstream evidence. It shows,
-deterministically, how derivative-maker's `loop_teardown_verify()` behaves across
-three generations during a build's loop + kpartx-partition-map teardown, and that the
-final version both fixes the field build failure and never orphans a device-mapper map.
+The build-side counterpart to this repo's upstream evidence. It shows, deterministically,
+how derivative-maker's `loop_teardown_verify()` behaves across four generations during a
+build's loop + kpartx-partition-map teardown, and that the final version tears the loop down
+on every case -- normal, kpartx false-positive, AND a persistent open count -- without ever
+orphaning a live map.
 
 ## The bug (old code)
 
-`help-steps/misc-helpers.bsh`, `loop_teardown_verify()`, tore down a build's loop +
-kpartx partition maps:
+`help-steps/misc-helpers.bsh`, `loop_teardown_verify()`, tore down a build's loop + kpartx
+partition maps with `kpartx -d` then an UNCONDITIONAL `losetup --detach`. Both failures were
+swallowed. When `kpartx -d` loses the udev/blkid race and leaves a `/dev/mapper/loopNpM` map,
+`losetup --detach` detaches the backing loop out from under it -- orphaning it: `Open count: 1`,
+no holder, unremovable even by `dmsetup remove --force/--retry/--deferred`.
+
+## Generation 2 -- the maps-before-detach gate (commit 2c98f7dcb)
+
+Detach the loop only once no `${base}pN` map remains. No more orphan -- but it has NO way to
+clear a map `kpartx -d` refused to remove, so it loops all 5 attempts and FAILS the build.
+
+## Generation 3 -- retry recovery (commit 0f459d4c)
+
+Adds `dmsetup remove --retry`, which consults the TRUE open count and so clears a kpartx FALSE
+positive (open count 0). This handles the common Qubes/docker false positive -- but NOT a map
+with a PERSISTENT open count > 0 (`--retry` cannot remove an open map), so it still fails there.
+
+## The persistent case (the real OVH build failure)
+
+On the OVH build host the image's GPT "Linux root x86-64" auto-discovery partition (type
+`4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709`) gets a PERSISTENT device-mapper open count of 1 with NO
+removable userspace holder (verified: empty `fuser`/`lsof`/proc-fd scan; not mounted; not LVM/md/
+bcache). It does not clear on `udevadm settle` or over minutes. `dmsetup remove --retry/--deferred`
+cannot remove an open map, so generation 3 loops 5x and fails `help-steps/unmount-raw`.
+
+## Generation 4 -- the robust fix (`new_loop_teardown_verify.bsh`)
+
+Adds `dmsetup remove --force` as a fallback. `--force` cannot DELETE an open map, but it loads
+the `error` target (`dmsetup table` becomes `0 <size> error`), which DROPS the map's reference
+to the loop device. The loop then detaches cleanly (`losetup --associated` goes to empty); the
+lingering error-target node holds no loop reference and clears on last close / reboot. Per loop:
 
 ```bash
-${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
-${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
+kpartx -d -s -v -- "${loop_devices_item}"
+# 1. clear a kpartx false positive (open count 0)
+dmsetup remove --retry "${map}"     # for each leftover ${base}pN
+# 2. a map that still survives has a persistent open count -> load the error target
+dmsetup remove --force "${map}"      # cannot delete it, but drops its loop reference
+# 3. detach only once every map is gone OR error-target'd (no live table on the loop)
+losetup --detach "${loop_devices_item}"
 ```
 
-Both failures are swallowed. When `kpartx -d` loses the udev/blkid race (it fails to
-remove a partition map), control falls straight through to `losetup --detach`, which
-detaches the backing loop out from under the surviving `/dev/mapper/loopNpM` map --
-leaving it orphaned: `Open count: 1`, no holder, and `dmsetup remove` (even
-`--force`/`--retry`/`--deferred`) cannot remove it. That stuck dm node is what this
-repository's upstream modules document.
-
-## The gate-only step (commit 2c98f7dcb) and the build failure it caused
-
-Settle udev before `kpartx -d`, and detach the loop only once **no** partition map for
-it remains, so a `kpartx -d` that loses the race can no longer orphan a map:
-
-```bash
-${SUDO_TO_ROOT} udevadm settle --timeout 5 || true
-...
-base="${loop_devices_item##*/}"
-${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
-maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
-if [ "${maps:-}" = "" ]; then
-   ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
-else
-   true "INFO: ${base} partition maps still present; leaving loop attached, will retry."
-fi
-```
-
-No more orphan -- but this version has **no way to clear a map `kpartx -d` refused to
-remove**. In a Qubes/Xen build VM (and in docker) `kpartx -d` RACES a udev/systemd
-probe of the image partition signatures and false-reports a map `in use. Not removing`
-even though the map's TRUE device-mapper open count is 0 (verified live on the OVH
-host). The gate saw the leftover map, never detached, looped all 5 attempts and FAILED
-the build at `help-steps/unmount-raw`.
-
-## The fix (new code, commit 0f459d4c)
-
-Keep the gate, and after `kpartx -d` remove any leftover `${base}pN` map **directly**
-with `dmsetup remove --retry`, which consults the TRUE open count:
-
-```bash
-maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
-if [ -n "${maps:-}" ]; then
-   while read -r map_item ; do
-      [ -n "${map_item:-}" ] || continue
-      ${SUDO_TO_ROOT} dmsetup remove --retry "${map_item}" || true "INFO: dmsetup remove non-zero exit code."
-   done <<< "${maps}"
-   maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
-fi
-if [ "${maps:-}" = "" ]; then
-   ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
-else
-   true "INFO: ${base} partition maps still present; leaving loop attached, will retry."
-fi
-```
-
-`dmsetup remove` clears a kpartx false positive (open count 0) yet a genuinely-held map
-(open count > 0) survives for the next attempt. So the build failure is fixed WITHOUT
-reintroducing the orphan: the loop is still detached only once no map remains, and if
-the maps never clear across the 5 attempts the function returns non-zero and the build
-fails **loudly** -- never "success" over a wedged map.
+A surviving map with a LIVE (non-error) table is never detached under (no orphan): the gate
+re-checks `dmsetup table` and leaves the loop attached to retry, failing loudly after 5 attempts.
 
 ## The proof
 
-The field failure is a race (`kpartx -d` losing to a transient udev/blkid open), which
-is hard to trigger on demand. `prove.sh` makes it **deterministic** by running the REAL
-function bodies of all three generations (`old_loop_teardown_verify.bsh`,
-`gate_only_loop_teardown_verify.bsh`, `new_loop_teardown_verify.bsh` -- verbatim copies)
-against PATH stubs that model the exact conditions: `kpartx -d` fails while a map is
-present (optionally until its own retry wins), `dmsetup remove` honors the map's TRUE
-open count, and `losetup --detach` succeeds. No root, loop devices, or device-mapper
-required.
+`prove.sh` runs the REAL function bodies of all four generations (`old_*`, `gate_only_*`,
+`retry_only_*`, `new_*` -- verbatim copies) against PATH stubs modelling each condition:
+`kpartx -d` leaving a map, `dmsetup remove --retry` honouring the true open count, `dmsetup
+remove --force` loading the error target, `dmsetup table` reporting error-vs-live, and
+`losetup --detach`. No root, loops, or device-mapper required.
 
-"Orphan" = a partition map still present with its backing loop already detached.
+"Orphan" = a LIVE (non-error) map still present with its backing loop already detached. A
+lingering ERROR-target map with the loop freed is NOT an orphan.
 
 ```
 $ ./prove.sh
-=== Scenario A: genuinely-held map (true open count > 0, never releases) ===
-  OLD loop_teardown_verify     rc=0  YES-ORPHAN(map present, loop detached)
-    PASS: OLD orphans the map and falsely returns 0
-  GATE-ONLY (2c98f7dcb)        rc=1  no (loop+map both kept -- honest, torn down by neither)
-    PASS: GATE-ONLY keeps both and returns non-zero (loud, no orphan)
-  NEW (0f459d4c)               rc=1  no (loop+map both kept -- honest, torn down by neither)
-    PASS: NEW keeps both and returns non-zero (no orphan reintroduced)
-
-=== Scenario B: kpartx -d itself wins after 2 failed attempts (transient) ===
-  OLD loop_teardown_verify     rc=0  YES-ORPHAN(map present, loop detached)
-    PASS: OLD detaches too early -> orphans the map, returns 0
-  NEW (0f459d4c)               rc=0  no (clean teardown -- map and loop both gone)
-    PASS: NEW waits, then cleanly tears down and returns 0
-
-=== Scenario C: kpartx false positive -- map left though TRUE open count is 0 ===
-    (the actual build failure: gate-only loops 5x and fails; new recovers)
-  GATE-ONLY (2c98f7dcb)        rc=1  no (loop+map both kept -- honest, torn down by neither)
-    PASS: GATE-ONLY cannot clear it -> returns non-zero (reproduces build failure)
-  NEW (0f459d4c)               rc=0  no (clean teardown -- map and loop both gone)
-    PASS: NEW clears it via dmsetup remove -> clean teardown, returns 0 (recovery)
-
-RESULT: 7 passed, 0 failed
-PROVEN: OLD orphans the map; GATE-ONLY fails the build on a kpartx false
-positive; NEW recovers the false positive yet never orphans a held map.
+=== Scenario A: PERSISTENT open count (no holder releases; kpartx -d never clears it) ===
+  OLD          rc=0  YES-ORPHAN       GATE-ONLY  rc=1  both kept
+  RETRY-ONLY   rc=1  both kept        NEW        rc=0  error-target lingers, loop freed
+=== Scenario B: kpartx false positive (open count 0) ===  RETRY-ONLY + NEW rc=0 clean; OLD orphans
+=== Scenario C: NO-ORPHAN backstop (--force cannot neutralize) ===  NEW rc=1, both kept (no orphan)
+=== Scenario D: transient (kpartx -d wins after 2) ===  OLD orphans; NEW rc=0, loop freed
+RESULT: 10 passed, 0 failed
 ```
 
-`prove.sh` exits non-zero if any case regresses, so it doubles as a regression test: it
-is RED against the old code (orphan), and scenario C is RED against the gate-only code
-(the build failure). If `new_loop_teardown_verify.bsh` ever regressed to the gate-only
-body, scenario C's NEW assertion flips to FAIL.
+`prove.sh` exits non-zero if any case regresses: it is RED against OLD (orphan), and scenario A
+is RED against GATE-ONLY and RETRY-ONLY (the build failure). If `new_*` ever regressed to the
+retry-only body, scenario A's NEW assertion flips to FAIL.
+
+`recover-real.sh` validates the generation-4 LEVER on REAL device-mapper (needs root; run in the
+sandbox): it holds a kpartx partition map open, shows `dmsetup remove --force` loads the error
+target, and that `losetup --detach` then frees the loop (association 1 -> 0) with no orphan.
 
 ## Files
 
-- `old_loop_teardown_verify.bsh` -- the function before any fix (orphans).
-- `gate_only_loop_teardown_verify.bsh` -- commit 2c98f7dcb (no orphan, but fails the
-  build on a kpartx false positive).
-- `new_loop_teardown_verify.bsh` -- commit 0f459d4c (recovers the false positive, no orphan).
-- `prove.sh` -- the deterministic three-generation harness (shellcheck-clean; no root).
+- `old_loop_teardown_verify.bsh` -- before any fix (orphans).
+- `gate_only_loop_teardown_verify.bsh` -- commit 2c98f7dcb (no orphan, fails the build).
+- `retry_only_loop_teardown_verify.bsh` -- commit 0f459d4c (clears false positive, fails persistent).
+- `new_loop_teardown_verify.bsh` -- robust: `--force` error-target fallback, no orphan.
+- `prove.sh` -- the deterministic four-generation harness (shellcheck-clean; no root).
+- `recover-real.sh` -- real device-mapper validation of the error-target recovery (root; sandbox).
 
-The fix is landed in derivative-maker: `help-steps/misc-helpers.bsh`, commit
-`0f459d4c` (on top of `2c98f7dcb`). The `.bsh` files here are verbatim copies for a
-self-contained proof; keep them in sync if the upstream function changes.
+The fix is landed in derivative-maker `help-steps/misc-helpers.bsh`. The `.bsh` files here are
+verbatim copies for a self-contained proof; keep them in sync if the upstream function changes.

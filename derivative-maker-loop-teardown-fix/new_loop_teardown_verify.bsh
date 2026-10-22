@@ -1,14 +1,16 @@
 #!/bin/bash
 # VERBATIM copy of derivative-maker help-steps/misc-helpers.bsh
-# loop_teardown_verify() AFTER the fix (commit 0f459d4c). It keeps the maps-before-
-# detach gate (commit 2c98f7dcb) and ADDS a direct `dmsetup remove --retry` of any
-# leftover ${base}pN map: dmsetup consults the TRUE device-mapper open count, so it
-# clears a kpartx false positive (open count 0) while a genuinely-held map
-# (open count > 0) survives for the next attempt -- preserving the no-orphan
-# ordering. Sourceable: defines the function, runs nothing.
+# loop_teardown_verify() AFTER the robust fix. Layered teardown of each ${base}pN map:
+#   1. dmsetup remove --retry -- removes a map kpartx only false-reported busy (open 0);
+#   2. dmsetup remove --force -- for a map with a PERSISTENT open count (GPT root-auto
+#      partition auto-opened by the host, no removable holder): cannot delete an open map
+#      but loads the 'error' target, dropping the map's reference to the loop;
+#   3. detach only once every map is gone OR neutralized to the error target, so a live
+#      map is never orphaned.
+# Sourceable: defines the function, runs nothing.
 
 loop_teardown_verify() {
-   local image loop_devices_output loop_devices_item attempt losetup_rc base maps map_item
+   local image loop_devices_output loop_devices_item attempt losetup_rc base maps map_item still_live table_target
    image="$1"
 
    if [ "${image:-}" = "" ]; then
@@ -32,27 +34,53 @@ loop_teardown_verify() {
          fi
          base="${loop_devices_item##*/}"
          ${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
-         ## kpartx -d RACES a udev/systemd probe of the image's partition signatures and
-         ## then reports a map "in use. Not removing" though the map's REAL device-mapper
-         ## open count is 0 (verified live). Remove any ${base}pN map it left behind
-         ## DIRECTLY with dmsetup, which checks the TRUE open count -- so it clears a kpartx
-         ## false positive (count 0), while a genuinely-held map (count > 0) survives for
-         ## the next attempt. (Cannot wrap kpartx in 'udevadm lock': help-steps/udevadm is a
-         ## no-op shim during image builds and would swallow the command.) Remove the maps
-         ## BEFORE detaching the loop: detaching under a live map orphans it ("Open count:1").
+
+         ## Layered teardown of any ${base}pN partition map kpartx -d left behind.
+         ## kpartx -d RACES a udev/systemd probe of the image's partition signatures and can
+         ## report a map "in use. Not removing" though its REAL device-mapper open count is 0;
+         ## and the GPT "Linux root x86-64" auto-discovery partition can be auto-opened by the
+         ## host with NO removable userspace holder, giving a PERSISTENT open count that does
+         ## not clear. (Cannot wrap kpartx in 'udevadm lock': help-steps/udevadm is a no-op
+         ## shim during image builds and would swallow the command.) Clear the maps BEFORE
+         ## detaching the loop: detaching under a LIVE map orphans it ("Open count:1").
          ## Root cause + proof: https://github.com/org-ai-assisted/kpartx-dmsetup-loop-teardown-busy
+         ##
+         ## 1. dmsetup remove --retry checks the TRUE open count, so it removes a map kpartx
+         ##    only false-reported busy (open count 0) while a genuinely-held map survives.
          maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
          if [ -n "${maps:-}" ]; then
             while read -r map_item ; do
                [ -n "${map_item:-}" ] || continue
-               ${SUDO_TO_ROOT} dmsetup remove --retry "${map_item}" || true "INFO: dmsetup remove non-zero exit code."
+               ${SUDO_TO_ROOT} dmsetup remove --retry "${map_item}" || true "INFO: dmsetup remove --retry non-zero exit code."
             done <<< "${maps}"
             maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
          fi
-         if [ "${maps:-}" = "" ]; then
+         ## 2. A map that SURVIVES has a persistent open count. dmsetup remove --force cannot
+         ##    delete an open map, but it loads the 'error' target, which DROPS the map's
+         ##    reference to the loop device -- so the loop can be detached without orphaning.
+         ##    The lingering error-target node is harmless (no loop ref; clears on last close).
+         if [ -n "${maps:-}" ]; then
+            while read -r map_item ; do
+               [ -n "${map_item:-}" ] || continue
+               ${SUDO_TO_ROOT} dmsetup remove --force "${map_item}" || true "INFO: dmsetup remove --force non-zero exit code."
+            done <<< "${maps}"
+         fi
+         ## 3. Detach only once every ${base}pN map is gone OR neutralized to the error target
+         ##    (no live table still references the loop). A surviving map with a live
+         ##    (non-error) table would be orphaned by a detach, so leave the loop attached and
+         ##    let the outer loop retry.
+         still_live="no"
+         while read -r map_item ; do
+            [ -n "${map_item:-}" ] || continue
+            table_target="$(${SUDO_TO_ROOT} dmsetup table "${map_item}" 2>/dev/null | awk '{ print $3 ; exit }')"
+            if [ -n "${table_target:-}" ] && [ "${table_target}" != "error" ]; then
+               still_live="yes"
+            fi
+         done <<< "$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
+         if [ "${still_live}" = "no" ]; then
             ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
          else
-            true "INFO: ${base} partition maps still present; leaving loop attached, will retry."
+            true "INFO: ${base} partition map(s) still live; leaving loop attached, will retry."
          fi
       done <<< "${loop_devices_output}"
       ${SUDO_TO_ROOT} udevadm settle --timeout 5 || true

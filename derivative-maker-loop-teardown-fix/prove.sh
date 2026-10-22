@@ -1,34 +1,35 @@
 #!/bin/bash
-# Deterministic proof of derivative-maker's loop_teardown_verify() across three
+# Deterministic proof of derivative-maker's loop_teardown_verify() across four
 # generations, run as the REAL function bodies against PATH stubs:
-#   old_loop_teardown_verify.bsh       -- pre-gate: kpartx -d then UNCONDITIONAL
-#                                         losetup --detach (orphans a surviving map).
-#   gate_only_loop_teardown_verify.bsh -- commit 2c98f7dcb: detach only once no
-#                                         ${base}pN map remains (no orphan), but with
-#                                         no way to clear a map kpartx -d refused to
-#                                         remove -> loops and FAILS the build when
-#                                         kpartx false-reports "in use" (open count 0).
-#   new_loop_teardown_verify.bsh       -- commit 0f459d4c: same gate PLUS a direct
-#                                         `dmsetup remove --retry`, which consults the
-#                                         TRUE open count: it clears a kpartx false
-#                                         positive (count 0) yet a genuinely-held map
-#                                         (count > 0) survives -- fixing the build
-#                                         failure WITHOUT reintroducing the orphan.
+#   old_loop_teardown_verify.bsh        -- pre-gate: kpartx -d then UNCONDITIONAL
+#                                          losetup --detach (orphans a surviving map).
+#   gate_only_loop_teardown_verify.bsh  -- commit 2c98f7dcb: detach only once no ${base}pN
+#                                          map remains (no orphan), but no way to clear a
+#                                          map kpartx -d refused to remove -> fails the build.
+#   retry_only_loop_teardown_verify.bsh -- commit 0f459d4c: adds 'dmsetup remove --retry',
+#                                          clearing a kpartx FALSE positive (open count 0);
+#                                          still FAILS a PERSISTENT open count (--retry cannot
+#                                          remove an open map).
+#   new_loop_teardown_verify.bsh        -- robust: adds 'dmsetup remove --force' as a fallback.
+#                                          --force cannot delete an open map but loads the
+#                                          'error' target, dropping the map's loop reference, so
+#                                          the loop detaches without orphaning. Detach is gated
+#                                          on every map being gone OR error-target'd.
 #
-# The field failure is a race (kpartx -d loses to a udev/blkid probe, so a map
-# survives) that is hard to trigger on demand. We make it deterministic with PATH
-# stubs that model the exact conditions:
-#   - kpartx -d fails (leaving the map) while $ST/kfail > 0, decrementing each call,
-#     then succeeds and removes it (models kpartx's own retry eventually winning);
-#   - dmsetup remove honors the map's TRUE open count in $ST/mapcount: count 0 ->
-#     remove succeeds (the kpartx false positive); count > 0 -> remove fails, map
-#     survives (a genuinely-held map), decrementing to model a later release;
-#   - losetup --detach succeeds (the loop really goes away).
+# The field failures are hard to trigger on demand, so PATH stubs model the exact conditions:
+#   - kpartx -d fails (leaving the map) while $ST/kfail > 0, decrementing each call, then
+#     succeeds and removes it (kpartx's own retry eventually winning);
+#   - dmsetup remove --retry removes the map iff its TRUE open count ($ST/mapcount) is 0;
+#   - dmsetup remove --force removes a free map, else loads the 'error' target (sets
+#     $ST/map_error) UNLESS $ST/forcefail is set (models force failing to neutralize);
+#   - dmsetup table reports 'error' once the map is neutralized, else 'linear' (live);
+#   - losetup --detach frees the loop.
 # No root, loops, or device-mapper needed -- pure logic proof.
 #
-# Orphan == a partition map still present with its backing loop already detached
-# (the stuck "Open count:1" dm node). A clean teardown leaves neither; an honest
-# failure leaves BOTH (loop kept, map kept) and returns non-zero.
+# Orphan == a LIVE (non-error) partition map still present with its backing loop already
+# detached (the stuck "Open count:1" dm node). A lingering ERROR-target map with the loop
+# freed is NOT an orphan (it holds no loop reference and clears on last close / reboot). A
+# clean teardown leaves neither map nor loop; an honest failure keeps BOTH and returns non-zero.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -47,28 +48,37 @@ EOF
    cat > "$b/kpartx" <<'EOF'
 #!/bin/bash
 # fail (leaving the map) while $ST/kfail > 0, decrementing each call; then succeed
-# and remove the map (models kpartx's own retry winning the udev race).
+# and remove the map (kpartx's own retry winning the udev race).
 n="$(cat "$ST/kfail" 2>/dev/null || echo 0)"
 if [ "$n" -gt 0 ]; then echo "$((n-1))" > "$ST/kfail"; exit 1; fi
-rm -f "$ST/map"; exit 0
+rm -f "$ST/map" "$ST/map_error"; exit 0
 EOF
    cat > "$b/dmsetup" <<'EOF'
 #!/bin/bash
-# `ls --noheadings`      -> list the partition map iff it still exists.
-# `remove [--retry] MAP` -> honor the map's TRUE open count in $ST/mapcount:
-#     count <= 0 : map genuinely free (kpartx false positive) -> remove it, succeed.
-#     count >  0 : map really held -> refuse, leave it, decrement (later release).
+# ls      -> list the map iff its node exists (lingers after --force too).
+# table   -> 'error' once neutralized, else 'linear ...' (a live table on the loop).
+# remove --retry -> remove iff the TRUE open count is 0; else fail, leave it.
+# remove --force -> remove a free map; for an open map load the error target (neutralize)
+#                   unless $ST/forcefail, returning non-zero either way (busy).
+c="$(cat "$ST/mapcount" 2>/dev/null || echo 0)"
 case "$1" in
-   ls)
-      [ -e "$ST/map" ] && echo "loop9p1	(252:0)"
-      exit 0
-      ;;
+   ls)    [ -e "$ST/map" ] && echo "loop9p1	(252:0)" ; exit 0 ;;
+   table)
+      if   [ -e "$ST/map_error" ]; then echo "0 16384 error"
+      elif [ -e "$ST/map" ];       then echo "0 16384 linear 7:9 2048"
+      fi
+      exit 0 ;;
    remove)
-      c="$(cat "$ST/mapcount" 2>/dev/null || echo 0)"
-      if [ "$c" -le 0 ]; then rm -f "$ST/map"; exit 0; fi
-      echo "$((c-1))" > "$ST/mapcount"
-      exit 1
-      ;;
+      case "$2" in
+         --retry)
+            if [ "$c" -le 0 ]; then rm -f "$ST/map" "$ST/map_error"; exit 0; fi
+            exit 1 ;;
+         --force)
+            if [ "$c" -le 0 ]; then rm -f "$ST/map" "$ST/map_error"; exit 0; fi
+            [ -e "$ST/forcefail" ] && exit 1
+            : > "$ST/map_error"; exit 1 ;;
+      esac
+      exit 0 ;;
 esac
 exit 0
 EOF
@@ -83,9 +93,9 @@ EOF
    chmod +x "$b"/*
 }
 
-run_case() {  # $1=label $2=function-file $3=kfail $4=mapcount -> prints result, sets pass/fail
-   local label="$1" fn="$2" kfail="$3" mapcount="$4"
-   local work rc orphan
+run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail(yes/no) -> prints result
+   local label="$1" fn="$2" kfail="$3" mapcount="$4" forcefail="$5"
+   local work rc orphan map_live
    work="$(mktemp -d)"
    export ST="$work/state"
    mkdir -p "$ST" "$work/bin"
@@ -93,9 +103,9 @@ run_case() {  # $1=label $2=function-file $3=kfail $4=mapcount -> prints result,
    : > "$ST/map"             # with one partition map present
    echo "$kfail" > "$ST/kfail"
    echo "$mapcount" > "$ST/mapcount"
+   [ "$forcefail" = "yes" ] && : > "$ST/forcefail"
    make_stubs "$work/bin"
 
-   # run the function under test with ONLY the stubs on PATH for the mocked tools
    (
       export PATH="$work/bin:$PATH"
       export SUDO_TO_ROOT=""
@@ -105,18 +115,19 @@ run_case() {  # $1=label $2=function-file $3=kfail $4=mapcount -> prints result,
    )
    rc=$?
 
-   if [ -e "$ST/map" ] && [ ! -e "$ST/loop" ]; then
-      orphan="YES-ORPHAN(map present, loop detached)"
-   elif [ -e "$ST/map" ] && [ -e "$ST/loop" ]; then
-      orphan="no (loop+map both kept -- honest, torn down by neither)"
-   elif [ ! -e "$ST/map" ] && [ ! -e "$ST/loop" ]; then
-      orphan="no (clean teardown -- map and loop both gone)"
+   map_live="no"
+   if [ -e "$ST/map" ] && [ ! -e "$ST/map_error" ]; then map_live="yes"; fi
+   if [ -e "$ST/loop" ]; then
+      if [ -e "$ST/map" ]; then orphan="no (loop+map both kept -- honest, torn down by neither)"
+      else orphan="no (map gone, loop kept)"; fi
    else
-      orphan="no (map gone, loop kept)"
+      if [ "$map_live" = "yes" ]; then orphan="YES-ORPHAN(live map present, loop detached)"
+      elif [ -e "$ST/map" ]; then orphan="no (error-target map lingers, loop freed -- harmless)"
+      else orphan="no (clean teardown -- map and loop both gone)"; fi
    fi
-   printf '  %-28s rc=%s  %s\n' "$label" "$rc" "$orphan" >&2   # visible line
+   printf '  %-30s rc=%s  %s\n' "$label" "$rc" "$orphan" >&2
    rm -rf "$work"
-   printf '%s|%s' "$rc" "$orphan"   # machine result on stdout (captured by caller)
+   printf '%s|%s' "$rc" "$orphan"
 }
 
 assert() {  # $1=desc $2=actual $3=expected-substring
@@ -127,35 +138,40 @@ assert() {  # $1=desc $2=actual $3=expected-substring
    fi
 }
 
-echo "=== Scenario A: genuinely-held map (true open count > 0, never releases) ==="
-a_old="$(run_case 'OLD loop_teardown_verify' "$here/old_loop_teardown_verify.bsh" 99 99 | tail -1)"
-assert "OLD orphans the map and falsely returns 0" "$a_old" '^0|YES-ORPHAN'
-a_gate="$(run_case 'GATE-ONLY (2c98f7dcb)' "$here/gate_only_loop_teardown_verify.bsh" 99 99 | tail -1)"
-assert "GATE-ONLY keeps both and returns non-zero (loud, no orphan)" "$a_gate" '^1|no (loop+map'
-a_new="$(run_case 'NEW (0f459d4c)' "$here/new_loop_teardown_verify.bsh" 99 99 | tail -1)"
-assert "NEW keeps both and returns non-zero (no orphan reintroduced)" "$a_new" '^1|no (loop+map'
+OLD="$here/old_loop_teardown_verify.bsh"
+GATE="$here/gate_only_loop_teardown_verify.bsh"
+RETRY="$here/retry_only_loop_teardown_verify.bsh"
+NEW="$here/new_loop_teardown_verify.bsh"
+
+echo "=== Scenario A: PERSISTENT open count (no holder releases; kpartx -d never clears it) ==="
+echo "    the real OVH build failure -- GPT root-auto partition auto-opened, never freed"
+assert "OLD orphans the map, falsely returns 0"               "$(run_case 'OLD'        "$OLD"   99 99 no | tail -1)" '^0|YES-ORPHAN'
+assert "GATE-ONLY cannot clear it -> non-zero (build fails)"  "$(run_case 'GATE-ONLY'  "$GATE"  99 99 no | tail -1)" '^1|no (loop+map'
+assert "RETRY-ONLY (0f459d4c) still fails -> non-zero"        "$(run_case 'RETRY-ONLY' "$RETRY" 99 99 no | tail -1)" '^1|no (loop+map'
+assert "NEW forces the error target, detaches -> 0, no orphan" "$(run_case 'NEW'       "$NEW"   99 99 no | tail -1)" '^0|no (error-target'
 
 echo
-echo "=== Scenario B: kpartx -d itself wins after 2 failed attempts (transient) ==="
-b_old="$(run_case 'OLD loop_teardown_verify' "$here/old_loop_teardown_verify.bsh" 2 99 | tail -1)"
-assert "OLD detaches too early -> orphans the map, returns 0" "$b_old" '^0|YES-ORPHAN'
-b_new="$(run_case 'NEW (0f459d4c)' "$here/new_loop_teardown_verify.bsh" 2 99 | tail -1)"
-assert "NEW waits, then cleanly tears down and returns 0" "$b_new" '^0|no (clean'
+echo "=== Scenario B: kpartx false positive (map left behind though TRUE open count is 0) ==="
+assert "OLD orphans the map, falsely returns 0"               "$(run_case 'OLD'        "$OLD"   99 0 no | tail -1)" '^0|YES-ORPHAN'
+assert "RETRY-ONLY clears it via --retry -> 0, clean"         "$(run_case 'RETRY-ONLY' "$RETRY" 99 0 no | tail -1)" '^0|no (clean'
+assert "NEW clears it via --retry (no force needed) -> 0, clean" "$(run_case 'NEW'     "$NEW"   99 0 no | tail -1)" '^0|no (clean'
 
 echo
-echo "=== Scenario C: kpartx false positive -- map left though TRUE open count is 0 ==="
-echo "    (the actual build failure: gate-only loops 5x and fails; new recovers)"
-c_gate="$(run_case 'GATE-ONLY (2c98f7dcb)' "$here/gate_only_loop_teardown_verify.bsh" 99 0 | tail -1)"
-assert "GATE-ONLY cannot clear it -> returns non-zero (reproduces build failure)" "$c_gate" '^1|no (loop+map'
-c_new="$(run_case 'NEW (0f459d4c)' "$here/new_loop_teardown_verify.bsh" 99 0 | tail -1)"
-assert "NEW clears it via dmsetup remove -> clean teardown, returns 0 (recovery)" "$c_new" '^0|no (clean'
+echo "=== Scenario C: NO-ORPHAN backstop -- persistent open AND --force cannot neutralize ==="
+echo "    (defensive: if --force fails to load the error target, NEW must NOT orphan)"
+assert "NEW refuses to detach a live map -> non-zero, both kept" "$(run_case 'NEW'     "$NEW"   99 99 yes | tail -1)" '^1|no (loop+map'
+
+echo
+echo "=== Scenario D: transient (kpartx -d itself wins after 2 attempts) ==="
+assert "OLD detaches too early -> orphans the map, returns 0"  "$(run_case 'OLD'        "$OLD"   2 99 no | tail -1)" '^0|YES-ORPHAN'
+assert "NEW tears down and returns 0 (loop freed, no orphan)"  "$(run_case 'NEW'        "$NEW"   2 99 no | tail -1)" '^0|no '
 
 echo
 echo "===================================================================="
 echo "RESULT: $pass passed, $fail failed"
 if [ "$fail" -eq 0 ]; then
-   echo "PROVEN: OLD orphans the map; GATE-ONLY fails the build on a kpartx false"
-   echo "positive; NEW recovers the false positive yet never orphans a held map."
+   echo "PROVEN: OLD orphans; GATE-ONLY and RETRY-ONLY both fail the build on a PERSISTENT"
+   echo "open count; NEW clears it with the error-target fallback and never orphans a live map."
 else
    echo "PROOF FAILED"
 fi

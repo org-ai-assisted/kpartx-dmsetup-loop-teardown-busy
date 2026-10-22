@@ -1,0 +1,61 @@
+#!/bin/bash
+# VERBATIM copy of derivative-maker help-steps/misc-helpers.bsh
+# loop_teardown_verify() at the RETRY-ONLY stage (commit 0f459d4c). It keeps the
+# maps-before-detach gate (2c98f7dcb) and adds 'dmsetup remove --retry' for a
+# leftover ${base}pN map, which clears a kpartx FALSE positive (open count 0). But
+# it has NO recovery for a map whose open count is PERSISTENTLY > 0 (the GPT
+# root-auto partition auto-opened by the host, no removable holder): --retry cannot
+# remove an open map, so this version loops all 5 attempts and FAILS the build -- the
+# regression new_loop_teardown_verify.bsh (adds 'dmsetup remove --force' to load the
+# error target) fixes. Sourceable: defines the function, runs nothing.
+
+loop_teardown_verify() {
+   local image loop_devices_output loop_devices_item attempt losetup_rc base maps map_item
+   image="$1"
+
+   if [ "${image:-}" = "" ]; then
+      return 1
+   fi
+
+   for (( attempt = 0; attempt < 5; attempt++ )); do
+      losetup_rc=0
+      loop_devices_output="$(${SUDO_TO_ROOT} losetup --associated "${image}" --noheadings --output NAME)" || losetup_rc="$?"
+      if [ "${losetup_rc}" != "0" ]; then
+         return 1
+      fi
+      if [ "${loop_devices_output:-}" = "" ]; then
+         return 0
+      fi
+      ## settle first so kpartx -d does not race a udev probe of a partition node
+      ${SUDO_TO_ROOT} udevadm settle --timeout 5 || true
+      while read -r loop_devices_item ; do
+         if [ "${loop_devices_item:-}" = "" ]; then
+            continue
+         fi
+         base="${loop_devices_item##*/}"
+         ${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
+         maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
+         if [ -n "${maps:-}" ]; then
+            while read -r map_item ; do
+               [ -n "${map_item:-}" ] || continue
+               ${SUDO_TO_ROOT} dmsetup remove --retry "${map_item}" || true "INFO: dmsetup remove non-zero exit code."
+            done <<< "${maps}"
+            maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
+         fi
+         if [ "${maps:-}" = "" ]; then
+            ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
+         else
+            true "INFO: ${base} partition maps still present; leaving loop attached, will retry."
+         fi
+      done <<< "${loop_devices_output}"
+      ${SUDO_TO_ROOT} udevadm settle --timeout 5 || true
+      sleep 1
+   done
+
+   losetup_rc=0
+   loop_devices_output="$(${SUDO_TO_ROOT} losetup --associated "${image}" --noheadings --output NAME)" || losetup_rc="$?"
+   if [ "${losetup_rc}" != "0" ]; then
+      return 1
+   fi
+   [ "${loop_devices_output:-}" = "" ]
+}
