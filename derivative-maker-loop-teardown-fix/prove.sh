@@ -55,14 +55,15 @@ rm -f "$ST/map" "$ST/map_error"; exit 0
 EOF
    cat > "$b/dmsetup" <<'EOF'
 #!/bin/bash
-# ls      -> list the map iff its node exists (lingers after --force too).
+# ls      -> list the map iff its node exists (lingers after --force too); exit non-zero
+#            if $ST/lsfail (models a failed/unreadable listing -> caller must fail closed).
 # table   -> 'error' once neutralized, else 'linear ...' (a live table on the loop).
 # remove --retry -> remove iff the TRUE open count is 0; else fail, leave it.
 # remove --force -> remove a free map; for an open map load the error target (neutralize)
 #                   unless $ST/forcefail, returning non-zero either way (busy).
 c="$(cat "$ST/mapcount" 2>/dev/null || echo 0)"
 case "$1" in
-   ls)    [ -e "$ST/map" ] && echo "loop9p1	(252:0)" ; exit 0 ;;
+   ls)    [ -e "$ST/lsfail" ] && exit 1; [ -e "$ST/map" ] && echo "loop9p1	(252:0)" ; exit 0 ;;
    table)
       if   [ -e "$ST/map_error" ]; then echo "0 16384 error"
       elif [ -e "$ST/map" ];       then echo "0 16384 linear 7:9 2048"
@@ -82,6 +83,12 @@ case "$1" in
 esac
 exit 0
 EOF
+   cat > "$b/findmnt" <<'EOF'
+#!/bin/bash
+# report the map node as MOUNTED iff $ST/mounted exists (models a live filesystem).
+[ -e "$ST/mounted" ] && exit 0
+exit 1
+EOF
    cat > "$b/udevadm" <<'EOF'
 #!/bin/bash
 exit 0
@@ -93,8 +100,8 @@ EOF
    chmod +x "$b"/*
 }
 
-run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail(yes/no) -> prints result
-   local label="$1" fn="$2" kfail="$3" mapcount="$4" forcefail="$5"
+run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail $6=lsfail $7=mounted (yes/no) -> prints result
+   local label="$1" fn="$2" kfail="$3" mapcount="$4" forcefail="$5" lsfail="${6:-no}" mounted="${7:-no}"
    local work rc orphan map_live
    work="$(mktemp -d)"
    export ST="$work/state"
@@ -104,6 +111,8 @@ run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail(yes/no) -> prin
    echo "$kfail" > "$ST/kfail"
    echo "$mapcount" > "$ST/mapcount"
    [ "$forcefail" = "yes" ] && : > "$ST/forcefail"
+   [ "$lsfail" = "yes" ] && : > "$ST/lsfail"
+   [ "$mounted" = "yes" ] && : > "$ST/mounted"
    make_stubs "$work/bin"
 
    (
@@ -164,7 +173,17 @@ assert "NEW refuses to detach a live map -> non-zero, both kept" "$(run_case 'NE
 echo
 echo "=== Scenario D: transient (kpartx -d itself wins after 2 attempts) ==="
 assert "OLD detaches too early -> orphans the map, returns 0"  "$(run_case 'OLD'        "$OLD"   2 99 no | tail -1)" '^0|YES-ORPHAN'
-assert "NEW tears down and returns 0 (loop freed, no orphan)"  "$(run_case 'NEW'        "$NEW"   2 99 no | tail -1)" '^0|no '
+assert "NEW tears down and returns 0 (loop freed, error node lingers, no orphan)" "$(run_case 'NEW' "$NEW" 2 99 no | tail -1)" '^0|no (error-target'
+
+echo
+echo "=== Scenario E: FAIL-CLOSED -- 'dmsetup ls' fails while a live map is present ==="
+echo "    (a failed listing must NEVER be read as 'no maps' and trigger a detach)"
+assert "RETRY-ONLY fails open: detaches on the empty listing -> orphan, returns 0" "$(run_case 'RETRY-ONLY' "$RETRY" 99 0 no yes no | tail -1)" '^0|YES-ORPHAN'
+assert "NEW fails closed: never detaches on an unreadable listing -> non-zero" "$(run_case 'NEW' "$NEW" 99 0 no yes no | tail -1)" '^1|no (loop+map'
+
+echo
+echo "=== Scenario F: REFUSE --force on a MOUNTED map (error target would corrupt the fs) ==="
+assert "NEW refuses to force a mounted map, never detaches -> non-zero, no orphan" "$(run_case 'NEW' "$NEW" 99 99 no no yes | tail -1)" '^1|no (loop+map'
 
 echo
 echo "===================================================================="

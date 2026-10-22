@@ -50,8 +50,14 @@ dmsetup remove --force "${map}"      # cannot delete it, but drops its loop refe
 losetup --detach "${loop_devices_item}"
 ```
 
-A surviving map with a LIVE (non-error) table is never detached under (no orphan): the gate
+A surviving map with a LIVE (non-error) table is never detached (no orphan): the gate
 re-checks `dmsetup table` and leaves the loop attached to retry, failing loudly after 5 attempts.
+The function is FAIL-CLOSED, via helpers `dm_partition_maps` / `dm_map_neutralized` /
+`dm_map_mounted`: a failed `dmsetup ls` (its exit status is no longer swallowed) is treated as
+"maps may remain" (do not detach); a map is "neutralized" only if EVERY table segment is the
+error target; and `--force` is REFUSED on a MOUNTED map (error-targeting a live filesystem would
+corrupt it -- teardown runs after `help-steps/unmount-raw` unmounts, so a map at the force step
+is an unmounted gpt-auto open, not a mount).
 
 ## The proof
 
@@ -72,16 +78,20 @@ $ ./prove.sh
 === Scenario B: kpartx false positive (open count 0) ===  RETRY-ONLY + NEW rc=0 clean; OLD orphans
 === Scenario C: NO-ORPHAN backstop (--force cannot neutralize) ===  NEW rc=1, both kept (no orphan)
 === Scenario D: transient (kpartx -d wins after 2) ===  OLD orphans; NEW rc=0, loop freed
-RESULT: 10 passed, 0 failed
+=== Scenario E: FAIL-CLOSED (dmsetup ls fails) ===  RETRY-ONLY fails open (orphan); NEW rc=1, no detach
+=== Scenario F: REFUSE --force on a MOUNTED map ===  NEW rc=1, no detach (no corruption)
+RESULT: 13 passed, 0 failed
 ```
 
-`prove.sh` exits non-zero if any case regresses: it is RED against OLD (orphan), and scenario A
-is RED against GATE-ONLY and RETRY-ONLY (the build failure). If `new_*` ever regressed to the
-retry-only body, scenario A's NEW assertion flips to FAIL.
+`prove.sh` exits non-zero if any case regresses: it is RED against OLD (orphan); scenario A is
+RED against GATE-ONLY and RETRY-ONLY (the build failure); and scenario E is RED against the
+fail-open `| grep || true` listing. If `new_*` ever regressed, the matching assertion flips to FAIL.
 
 `recover-real.sh` validates the generation-4 LEVER on REAL device-mapper (needs root; run in the
-sandbox): it holds a kpartx partition map open, shows `dmsetup remove --force` loads the error
-target, and that `losetup --detach` then frees the loop (association 1 -> 0) with no orphan.
+sandbox): it holds a kpartx partition map open, asserts the hold is real (open count > 0, else the
+test is vacuous), then drives the REAL `loop_teardown_verify` and requires that it freed the loop
+(association 1 -> 0) via the `--force` error target (the map ends as the error target) with no
+live-map orphan.
 
 ## Files
 

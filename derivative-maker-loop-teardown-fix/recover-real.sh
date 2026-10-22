@@ -59,7 +59,11 @@ dmsetup deps -o devname "$part" 2>/dev/null | grep -qw "(${base})" \
 sleep 600 < "$node" &
 holder=$!
 sleep 0.3
-echo "setup: ${part} open count before teardown: $(dmsetup info -c --noheadings -o open "$part" 2>/dev/null)"
+open_before="$(dmsetup info -c --noheadings -o open "$part" 2>/dev/null || echo 0)"
+echo "setup: ${part} open count before teardown: ${open_before}"
+# De-vacuous: if the holder did not actually hold the map open, --retry would remove it
+# cleanly and the --force path would never run -- the test would prove nothing.
+[ "${open_before:-0}" -gt 0 ] || fail "holder did not hold ${part} open (open=${open_before}); test would be vacuous"
 
 # Drive the REAL function. We are root, so SUDO_TO_ROOT is empty.
 # shellcheck source=new_loop_teardown_verify.bsh disable=SC1091
@@ -84,10 +88,17 @@ for m in $(dmsetup ls --noheadings 2>/dev/null | awk '{print $1}' | grep -E "^${
 done
 echo "live (non-error) map still present: ${live_orphan}"
 
-if [ "$rc" -eq 0 ] && [ -z "${assoc_after:-}" ] && [ "$live_orphan" = "no" ]; then
-	echo "RECOVERED: the real loop_teardown_verify freed the loop (open map neutralized via the"
-	echo "error target, no live-map orphan) and returned 0."
+# Prove the --force path actually ran: the map was held open (open_before > 0) so --retry
+# could not remove it; a RECOVERED verdict therefore requires the map to end as the error
+# target (what --force loads), not cleanly gone -- else recovery was never exercised.
+force_target="$(dmsetup table "$part" 2>/dev/null | awk '{print $3; exit}' || true)"
+echo "post-teardown ${part} table target: ${force_target:-<gone>}"
+
+if [ "$rc" -eq 0 ] && [ -z "${assoc_after:-}" ] && [ "$live_orphan" = "no" ] && [ "${force_target:-}" = "error" ]; then
+	echo "RECOVERED: ${part} held open (count ${open_before}) -> --retry refused -> --force loaded"
+	echo "the error target -> loop freed, no live-map orphan, loop_teardown_verify returned 0."
 else
-	echo "NOT RECOVERED (rc=$rc, assoc_after=[${assoc_after:-none}], live_orphan=${live_orphan})."
+	echo "NOT RECOVERED (rc=$rc, assoc_after=[${assoc_after:-none}], live_orphan=${live_orphan}," \
+	     "force_target=[${force_target:-none}], open_before=${open_before:-?})."
 	exit 1
 fi
