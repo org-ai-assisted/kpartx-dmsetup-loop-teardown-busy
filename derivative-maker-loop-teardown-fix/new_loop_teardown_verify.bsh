@@ -1,11 +1,14 @@
 #!/bin/bash
-# PROPOSED derivative-maker help-steps/misc-helpers.bsh loop_teardown_verify()
-# AFTER the fix: the loop is detached only once no partition map for it remains,
-# so a kpartx -d that loses the udev race (or exits 0 yet leaves a stale map,
-# Debian #891077) can no longer orphan it. Sourceable: defines the function.
+# VERBATIM copy of derivative-maker help-steps/misc-helpers.bsh
+# loop_teardown_verify() AFTER the fix (commit 0f459d4c). It keeps the maps-before-
+# detach gate (commit 2c98f7dcb) and ADDS a direct `dmsetup remove --retry` of any
+# leftover ${base}pN map: dmsetup consults the TRUE device-mapper open count, so it
+# clears a kpartx false positive (open count 0) while a genuinely-held map
+# (open count > 0) survives for the next attempt -- preserving the no-orphan
+# ordering. Sourceable: defines the function, runs nothing.
 
 loop_teardown_verify() {
-   local image loop_devices_output loop_devices_item attempt losetup_rc base maps
+   local image loop_devices_output loop_devices_item attempt losetup_rc base maps map_item
    image="$1"
 
    if [ "${image:-}" = "" ]; then
@@ -29,10 +32,23 @@ loop_teardown_verify() {
          fi
          base="${loop_devices_item##*/}"
          ${SUDO_TO_ROOT} kpartx -d -s -v -- "${loop_devices_item}" || true "INFO: kpartx non-zero exit code."
-         ## Detach only once no ${base}pN map remains; detaching while one is
-         ## present orphans it (unremovable, "Open count:1"). Repro + fix proof:
-         ## https://github.com/org-ai-assisted/kpartx-dmsetup-loop-teardown-busy
+         ## kpartx -d RACES a udev/systemd probe of the image's partition signatures and
+         ## then reports a map "in use. Not removing" though the map's REAL device-mapper
+         ## open count is 0 (verified live). Remove any ${base}pN map it left behind
+         ## DIRECTLY with dmsetup, which checks the TRUE open count -- so it clears a kpartx
+         ## false positive (count 0), while a genuinely-held map (count > 0) survives for
+         ## the next attempt. (Cannot wrap kpartx in 'udevadm lock': help-steps/udevadm is a
+         ## no-op shim during image builds and would swallow the command.) Remove the maps
+         ## BEFORE detaching the loop: detaching under a live map orphans it ("Open count:1").
+         ## Root cause + proof: https://github.com/org-ai-assisted/kpartx-dmsetup-loop-teardown-busy
          maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
+         if [ -n "${maps:-}" ]; then
+            while read -r map_item ; do
+               [ -n "${map_item:-}" ] || continue
+               ${SUDO_TO_ROOT} dmsetup remove --retry "${map_item}" || true "INFO: dmsetup remove non-zero exit code."
+            done <<< "${maps}"
+            maps="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null | awk '{ print $1 }' | grep -E "^${base}p[0-9]+$" || true)"
+         fi
          if [ "${maps:-}" = "" ]; then
             ${SUDO_TO_ROOT} losetup --detach "${loop_devices_item}" || true "INFO: losetup non-zero exit code."
          else
