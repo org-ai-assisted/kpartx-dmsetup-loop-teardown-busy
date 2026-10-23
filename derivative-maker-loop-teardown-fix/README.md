@@ -57,7 +57,10 @@ The function is FAIL-CLOSED, via helpers `dm_partition_maps` / `dm_map_neutraliz
 "maps may remain" (do not detach); a map is "neutralized" only if EVERY table segment is the
 error target; and `--force` is REFUSED on a MOUNTED map (error-targeting a live filesystem would
 corrupt it -- teardown runs after `help-steps/unmount-raw` unmounts, so a map at the force step
-is an unmounted gpt-auto open, not a mount).
+is an unmounted gpt-auto open, not a mount). OWNERSHIP: `dm_partition_maps` emits a `${base}pN`
+map only when it is not CONFIRMED backed by a different block device (`dmsetup deps -o blkdevname`
+names this loop), so a coincidentally-named foreign map (e.g. one named `loop0p1` but backed by
+`/dev/sda1`) is never removed or allowed to gate the detach.
 
 ## The proof
 

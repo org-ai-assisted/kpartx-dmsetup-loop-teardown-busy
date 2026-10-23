@@ -8,6 +8,9 @@
 #      MOUNTED map (would corrupt a live filesystem);
 #   3. detach only once every map is gone OR CONFIRMED neutralized (fail-closed: a failed
 #      dmsetup ls / unreadable table / any live segment keeps the loop attached).
+# OWNERSHIP: dm_partition_maps emits only a ${base}pN map actually BACKED BY this loop (its
+# dmsetup deps include the loop's major:minor), so a coincidentally-named foreign map is
+# never removed or allowed to gate the detach.
 # Sourceable: defines the functions, runs nothing.
 
 ## List the ${base}pN device-mapper partition maps for a loop basename on stdout (one per
@@ -15,14 +18,39 @@
 ## mistaken for "no maps left", which would detach the loop under a still-present map (an
 ## orphan). Callers treat a non-zero return as "maps may remain" and keep the loop attached.
 dm_partition_maps() {
-   local base_name dm_ls_output dm_ls_rc
+   local base_name dm_ls_output dm_ls_rc matched map_item map_deps
    base_name="$1"
    dm_ls_rc=0
    dm_ls_output="$(${SUDO_TO_ROOT} dmsetup ls --noheadings 2>/dev/null)" || dm_ls_rc="$?"
    if [ "${dm_ls_rc}" != "0" ]; then
       return "${dm_ls_rc}"
    fi
-   printf '%s\n' "${dm_ls_output}" | awk '{ print $1 }' | grep -E "^${base_name}p[0-9]+$" || true
+   matched="$(printf '%s\n' "${dm_ls_output}" | awk '{ print $1 }' | grep -E "^${base_name}p[0-9]+$" || true)"
+   [ -n "${matched}" ] || return 0
+   ## OWNERSHIP: emit a ${base}pN map unless it is CONFIRMED backed by a DIFFERENT block device
+   ## -- i.e. 'dmsetup deps -o blkdevname' is readable and does NOT name this loop. That excludes
+   ## a coincidentally-named foreign map (e.g. a linear map named ${base}p1 backed by /dev/sda1):
+   ## never remove it, never let it gate our detach. Unreadable deps -> INCLUDE the map (the
+   ## no-orphan guarantee wins; a foreign map with unreadable deps too is doubly unlikely).
+   while read -r map_item ; do
+      [ -n "${map_item:-}" ] || continue
+      map_deps="$(${SUDO_TO_ROOT} dmsetup deps --noheadings -o blkdevname "${map_item}" 2>/dev/null || true)"
+      if [ -n "${map_deps}" ]; then
+         ## normalise to space-padded alphanumeric tokens, then match the loop's name as a
+         ## whole token (so loop0 does not match loop10).
+         case " ${map_deps//[^a-zA-Z0-9]/ } " in
+            *" ${base_name} "*)
+               true "backed by ${base_name}"
+               ;;
+            *)
+               true "INFO: ${map_item} not backed by ${base_name}; skipping foreign map."
+               continue
+               ;;
+         esac
+      fi
+      printf '%s\n' "${map_item}"
+   done <<< "${matched}"
+   return 0
 }
 
 ## True (0) only if a map is CONFIRMED neutralized: its table is readable AND every segment is

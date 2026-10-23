@@ -64,6 +64,7 @@ EOF
 c="$(cat "$ST/mapcount" 2>/dev/null || echo 0)"
 case "$1" in
    ls)    [ -e "$ST/lsfail" ] && exit 1; [ -e "$ST/map" ] && echo "loop9p1	(252:0)" ; exit 0 ;;
+   deps)  [ -e "$ST/map" ] && echo "1 dependencies  : (loop9)" ; exit 0 ;;   # loop9p1 backed by loop9 = owned
    table)
       if   [ -e "$ST/map_error" ]; then echo "0 16384 error"
       elif [ -e "$ST/map" ];       then echo "0 16384 linear 7:9 2048"
