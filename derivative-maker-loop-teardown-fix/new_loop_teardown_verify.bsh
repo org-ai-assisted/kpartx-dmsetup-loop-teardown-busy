@@ -8,15 +8,31 @@
 #      MOUNTED map (would corrupt a live filesystem);
 #   3. detach only once every map is gone OR CONFIRMED neutralized (fail-closed: a failed
 #      dmsetup ls / unreadable table / any live segment keeps the loop attached).
-# OWNERSHIP: dm_partition_maps emits only a ${base}pN map actually BACKED BY this loop (its
-# dmsetup deps include the loop's major:minor), so a coincidentally-named foreign map is
-# never removed or allowed to gate the detach.
+# OWNERSHIP (3-way, fail-closed): dm_partition_maps classifies each ${base}pN map by its
+# 'dmsetup deps -o blkdevname' as OWNED (names this loop -> remove + gate), FOREIGN (a NAMED
+# other device -> omit entirely), or UNKNOWN (deps unreadable/empty/only-numeric -> gate but
+# never remove). dm_map_owned_by restricts the destructive --retry/--force to OWNED maps, so a
+# coincidentally-named foreign map is never destroyed and an owned map with unresolvable deps
+# is gated (no orphan) rather than dropped. dm_map_mounted fails CLOSED on an unreadable table.
 # Sourceable: defines the functions, runs nothing.
-
-## List the ${base}pN device-mapper partition maps for a loop basename on stdout (one per
-## line). Returns 'dmsetup ls's OWN exit status: a FAILED or unreadable listing must never be
-## mistaken for "no maps left", which would detach the loop under a still-present map (an
-## orphan). Callers treat a non-zero return as "maps may remain" and keep the loop attached.
+## List the ${base}pN device-mapper partition maps to GATE the loop detach on, one per line.
+## Returns 'dmsetup ls's OWN exit status: a FAILED or unreadable listing must never be mistaken
+## for "no maps left", which would detach the loop under a still-present map (an orphan). Callers
+## treat a non-zero return as "maps may remain" and keep the loop attached.
+##
+## CLASSIFY each ${base}pN map by 'dmsetup deps -o blkdevname' into three cases and emit all but
+## FOREIGN (3-way, fail-closed):
+##   OWNED   -- deps resolvably name THIS loop                -> emit (remove + gate).
+##   FOREIGN -- deps resolve to a NAMED device that is NOT this loop (e.g. a coincidentally-named
+##              ${base}p1 backed by /dev/sda1)                -> OMIT (never remove, never gate).
+##   UNKNOWN -- deps unreadable, empty, OR only numeric major:minor (name could not resolve)
+##                                                            -> emit (gate), but NOT removed.
+## An UNKNOWN map could be ours, so it GATES the detach (never orphan it); but it could also be a
+## foreign map whose name failed to resolve, so the DESTRUCTIVE remove steps (--retry/--force) are
+## separately restricted to OWNED maps via dm_map_owned_by -- an unknown map is left for the gate
+## to fail loud on rather than destroyed. (Earlier a numeric-fallback deps string was misread as
+## FOREIGN and DROPPED, so an owned map with unresolvable deps was neither removed nor gated -> an
+## orphan; UNKNOWN now fixes that without destroying a genuinely-foreign map.)
 dm_partition_maps() {
    local base_name dm_ls_output dm_ls_rc matched map_item map_deps
    base_name="$1"
@@ -27,30 +43,59 @@ dm_partition_maps() {
    fi
    matched="$(printf '%s\n' "${dm_ls_output}" | awk '{ print $1 }' | grep -E "^${base_name}p[0-9]+$" || true)"
    [ -n "${matched}" ] || return 0
-   ## OWNERSHIP: emit a ${base}pN map unless it is CONFIRMED backed by a DIFFERENT block device
-   ## -- i.e. 'dmsetup deps -o blkdevname' is readable and does NOT name this loop. That excludes
-   ## a coincidentally-named foreign map (e.g. a linear map named ${base}p1 backed by /dev/sda1):
-   ## never remove it, never let it gate our detach. Unreadable deps -> INCLUDE the map (the
-   ## no-orphan guarantee wins; a foreign map with unreadable deps too is doubly unlikely).
+   local map_dev
    while read -r map_item ; do
       [ -n "${map_item:-}" ] || continue
       map_deps="$(${SUDO_TO_ROOT} dmsetup deps --noheadings -o blkdevname "${map_item}" 2>/dev/null || true)"
-      if [ -n "${map_deps}" ]; then
-         ## normalise to space-padded alphanumeric tokens, then match the loop's name as a
-         ## whole token (so loop0 does not match loop10).
-         case " ${map_deps//[^a-zA-Z0-9]/ } " in
-            *" ${base_name} "*)
-               true "backed by ${base_name}"
-               ;;
-            *)
-               true "INFO: ${map_item} not backed by ${base_name}; skipping foreign map."
-               continue
-               ;;
-         esac
-      fi
+      ## dmsetup prints "N dependencies  : (<dev>)" EVEN with --noheadings, so extract the token(s)
+      ## INSIDE the parentheses first -- otherwise the literal word "dependencies" is mistaken for a
+      ## device name and every map misreads as FOREIGN. No parens (empty/odd) -> map_dev is empty.
+      map_dev="${map_deps#*\(}"
+      map_dev="${map_dev%\)*}"
+      [ "${map_dev}" = "${map_deps}" ] && map_dev=""   ## no '(' matched -> no resolvable device
+      ## normalise to space-padded alphanumeric tokens, then match the loop's name as a whole token
+      ## (so loop0 does not match loop10). OWNED must be tested BEFORE FOREIGN: an owned dev also
+      ## contains letters.
+      case " ${map_dev//[^a-zA-Z0-9]/ } " in
+         *" ${base_name} "*)
+            true "owned: ${map_item} backed by ${base_name}"
+            ;;
+         *[a-zA-Z]*)
+            true "INFO: ${map_item} backed by a different named device; skipping foreign map."
+            continue
+            ;;
+         *)
+            true "unknown: ${map_item} deps empty/numeric; cannot confirm owner -- gate, never force."
+            ;;
+      esac
       printf '%s\n' "${map_item}"
    done <<< "${matched}"
    return 0
+}
+
+## True (0) only if a map's 'dmsetup deps -o blkdevname' resolvably name THIS loop (OWNED). An
+## UNKNOWN map (deps unreadable, empty, or only numeric major:minor) and a FOREIGN map (a named
+## device that is not this loop) both return non-zero. Gates the DESTRUCTIVE remove steps: only an
+## OWNED map is 'dmsetup remove --retry/--force'd; an UNKNOWN map -- which could be a foreign map
+## whose name did not resolve -- is never removed, only left for the detach gate to fail loud on.
+dm_map_owned_by() {
+   local base_name map_name map_deps map_dev
+   base_name="$1"
+   map_name="$2"
+   map_deps="$(${SUDO_TO_ROOT} dmsetup deps --noheadings -o blkdevname "${map_name}" 2>/dev/null || true)"
+   ## extract the device token(s) INSIDE the parentheses (dmsetup keeps the "N dependencies :"
+   ## prefix even with --noheadings); only an owned loop name there counts as OWNED.
+   map_dev="${map_deps#*\(}"
+   map_dev="${map_dev%\)*}"
+   [ "${map_dev}" = "${map_deps}" ] && map_dev=""
+   case " ${map_dev//[^a-zA-Z0-9]/ } " in
+      *" ${base_name} "*)
+         return 0
+         ;;
+      *)
+         return 1
+         ;;
+   esac
 }
 
 ## True (0) only if a map is CONFIRMED neutralized: its table is readable AND every segment is
@@ -74,6 +119,13 @@ dm_map_neutralized() {
 ## build-steps.d/1100_sanity-tests self-test) UNMOUNT before calling loop_teardown_verify, so a
 ## map still present at the force step is an unmounted gpt-auto open, not a live mount.
 dm_map_mounted() {
+   ## FAIL CLOSED: findmnt returns non-zero for BOTH a clean no-match AND a read error (binary
+   ## missing, /proc unreadable), so probe the whole table first. An unreadable table -> return 0
+   ## (treat as MOUNTED) so --force is refused: never error-target a live filesystem on a table we
+   ## could not read. A readable table -> the --source lookup's non-zero is a genuine no-match.
+   ## (A readable-but-EMPTY table also makes the probe return non-zero -> fail closed; harmless
+   ## here -- teardown runs on a build host whose mount table always has entries.)
+   findmnt --noheadings >/dev/null 2>&1 || return 0
    findmnt --noheadings --source "/dev/mapper/$1" >/dev/null 2>&1
 }
 
@@ -131,6 +183,8 @@ loop_teardown_verify() {
          if [ -n "${maps:-}" ]; then
             while read -r map_item ; do
                [ -n "${map_item:-}" ] || continue
+               ## Remove only an OWNED map; an UNKNOWN (maybe-foreign) map is gated, never removed.
+               dm_map_owned_by "${base}" "${map_item}" || continue
                ${SUDO_TO_ROOT} dmsetup remove --retry "${map_item}" || true "INFO: dmsetup remove --retry non-zero exit code."
             done <<< "${maps}"
             maps_rc=0
@@ -149,6 +203,12 @@ loop_teardown_verify() {
          if [ -n "${maps:-}" ]; then
             while read -r map_item ; do
                [ -n "${map_item:-}" ] || continue
+               ## --force error-targets the map (DESTRUCTIVE): restrict to OWNED maps so an UNKNOWN
+               ## (maybe-foreign) map is never destroyed -- it stays and the detach gate fails loud.
+               if ! dm_map_owned_by "${base}" "${map_item}"; then
+                  true "INFO: ${map_item} ownership unconfirmed (unknown deps); refusing --force -- gating detach."
+                  continue
+               fi
                if dm_map_mounted "${map_item}"; then
                   true "INFO: ${map_item} is MOUNTED; refusing to force -- leaving loop attached."
                   continue

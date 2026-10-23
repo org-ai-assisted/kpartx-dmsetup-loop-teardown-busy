@@ -64,7 +64,20 @@ EOF
 c="$(cat "$ST/mapcount" 2>/dev/null || echo 0)"
 case "$1" in
    ls)    [ -e "$ST/lsfail" ] && exit 1; [ -e "$ST/map" ] && echo "loop9p1	(252:0)" ; exit 0 ;;
-   deps)  [ -e "$ST/map" ] && echo "1 dependencies  : (loop9)" ; exit 0 ;;   # loop9p1 backed by loop9 = owned
+   deps)
+      # 'dmsetup deps --noheadings -o blkdevname <map>' -> the "N dependencies : (<dev>)" format
+      # (the prefix is printed even with --noheadings). $ST/deps_mode selects the backing:
+      #   owned (default) = (loop9) our loop; foreign = (sda1) a different named device;
+      #   numeric = (7, 0) name unresolvable; empty = no output (deps unreadable).
+      if [ -e "$ST/map" ]; then
+         case "$(cat "$ST/deps_mode" 2>/dev/null || echo owned)" in
+            foreign) echo "1 dependencies  : (sda1)" ;;
+            numeric) echo "1 dependencies  : (7, 0)" ;;
+            empty)   : ;;
+            *)       echo "1 dependencies  : (loop9)" ;;
+         esac
+      fi
+      exit 0 ;;
    table)
       if   [ -e "$ST/map_error" ]; then echo "0 16384 error"
       elif [ -e "$ST/map" ];       then echo "0 16384 linear 7:9 2048"
@@ -86,9 +99,16 @@ exit 0
 EOF
    cat > "$b/findmnt" <<'EOF'
 #!/bin/bash
-# report the map node as MOUNTED iff $ST/mounted exists (models a live filesystem).
-[ -e "$ST/mounted" ] && exit 0
-exit 1
+# Two call shapes drive dm_map_mounted's FAIL-CLOSED probe:
+#   BARE 'findmnt --noheadings' (no --source) = the whole-table READABILITY probe. The table is
+#   readable here -> exit 0, UNLESS $ST/findmnt_unreadable models an unreadable/missing table
+#   (binary gone, /proc unreadable) -> exit 1, which makes dm_map_mounted fail closed (treat the
+#   map as mounted, refuse --force).
+#   'findmnt --source <map>' = exit 0 iff $ST/mounted (map has a live fs), else exit 1 (a
+#   readable no-match: the map is simply not mounted).
+[ -e "$ST/findmnt_unreadable" ] && exit 1
+for a in "$@"; do [ "$a" = "--source" ] && { [ -e "$ST/mounted" ] && exit 0; exit 1; }; done
+exit 0
 EOF
    cat > "$b/udevadm" <<'EOF'
 #!/bin/bash
@@ -101,8 +121,8 @@ EOF
    chmod +x "$b"/*
 }
 
-run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail $6=lsfail $7=mounted (yes/no) -> prints result
-   local label="$1" fn="$2" kfail="$3" mapcount="$4" forcefail="$5" lsfail="${6:-no}" mounted="${7:-no}"
+run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail $6=lsfail $7=mounted $8=deps_mode(owned|foreign|numeric|empty) $9=findmnt_unreadable(yes/no)
+   local label="$1" fn="$2" kfail="$3" mapcount="$4" forcefail="$5" lsfail="${6:-no}" mounted="${7:-no}" deps_mode="${8:-owned}" findmnt_unreadable="${9:-no}"
    local work rc orphan map_live
    work="$(mktemp -d)"
    export ST="$work/state"
@@ -114,6 +134,9 @@ run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail $6=lsfail $7=mo
    [ "$forcefail" = "yes" ] && : > "$ST/forcefail"
    [ "$lsfail" = "yes" ] && : > "$ST/lsfail"
    [ "$mounted" = "yes" ] && : > "$ST/mounted"
+   printf '%s' "$deps_mode" > "$ST/deps_mode"
+   [ "$deps_mode" = "foreign" ] && : > "$ST/foreign"   # a map backed by a DIFFERENT device, spared
+   [ "$findmnt_unreadable" = "yes" ] && : > "$ST/findmnt_unreadable"
    make_stubs "$work/bin"
 
    (
@@ -131,7 +154,8 @@ run_case() {  # $1=label $2=fn $3=kfail $4=mapcount $5=forcefail $6=lsfail $7=mo
       if [ -e "$ST/map" ]; then orphan="no (loop+map both kept -- honest, torn down by neither)"
       else orphan="no (map gone, loop kept)"; fi
    else
-      if [ "$map_live" = "yes" ]; then orphan="YES-ORPHAN(live map present, loop detached)"
+      if [ -e "$ST/foreign" ] && [ -e "$ST/map" ]; then orphan="no (foreign map spared, loop detached -- correct)"
+      elif [ "$map_live" = "yes" ]; then orphan="YES-ORPHAN(live map present, loop detached)"
       elif [ -e "$ST/map" ]; then orphan="no (error-target map lingers, loop freed -- harmless)"
       else orphan="no (clean teardown -- map and loop both gone)"; fi
    fi
@@ -185,6 +209,21 @@ assert "NEW fails closed: never detaches on an unreadable listing -> non-zero" "
 echo
 echo "=== Scenario F: REFUSE --force on a MOUNTED map (error target would corrupt the fs) ==="
 assert "NEW refuses to force a mounted map, never detaches -> non-zero, no orphan" "$(run_case 'NEW' "$NEW" 99 99 no no yes | tail -1)" '^1|no (loop+map'
+
+echo
+echo
+echo "=== Scenario G: OWNERSHIP -- a coincidentally-named FOREIGN map is spared + excluded ==="
+echo "    (a map named loop9p1 but backed by /dev/sda1: never removed, never gates our detach)"
+assert "NEW spares the foreign map and still detaches the loop -> 0, no orphan" "$(run_case 'NEW' "$NEW" 99 0 no no no foreign | tail -1)" '^0|no (foreign map spared'
+
+echo
+echo "=== Scenario H: UNKNOWN deps (numeric, unresolvable) -- GATED, never dropped/forced ==="
+echo "    numeric deps -> cannot confirm owner -> gate the detach (no orphan) but never --force it"
+assert "NEW gates an unknown map: non-zero, loop+map kept (not dropped, not destroyed)" "$(run_case 'NEW' "$NEW" 99 99 no no no numeric | tail -1)" '^1|no (loop+map'
+
+echo
+echo "=== Scenario I: FAIL-CLOSED -- findmnt table unreadable -> dm_map_mounted refuses --force ==="
+assert "NEW refuses --force on an unreadable mount table -> non-zero, no orphan" "$(run_case 'NEW' "$NEW" 99 99 no no no owned yes | tail -1)" '^1|no (loop+map'
 
 echo
 echo "===================================================================="

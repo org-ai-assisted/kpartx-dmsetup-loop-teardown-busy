@@ -80,12 +80,24 @@ assoc_after="$(losetup --associated "$img" --noheadings --output NAME 2>/dev/nul
 echo "loop still associated with image: [${assoc_after:-<none>}]"
 
 # Any ${base}pN map still carrying a LIVE (non-error) table would be an orphan if the loop
-# were detached. Confirm none remain.
+# were detached. Confirm none remain -- FAIL CLOSED: a failed 'dmsetup ls' or an unreadable/
+# empty 'dmsetup table' must NEVER read as "no orphan" (that would print a false RECOVERED).
 live_orphan="no"
-for m in $(dmsetup ls --noheadings 2>/dev/null | awk '{print $1}' | grep -E "^${base}p[0-9]+$"); do
-	t="$(dmsetup table "$m" 2>/dev/null | awk '{print $3; exit}')"
-	if [ -n "$t" ] && [ "$t" != "error" ]; then live_orphan="yes ($m -> $t)"; fi
-done
+ls_rc=0
+ls_out="$(dmsetup ls --noheadings 2>/dev/null)" || ls_rc=$?
+if [ "$ls_rc" != "0" ]; then
+	live_orphan="UNKNOWN (dmsetup ls failed rc=$ls_rc -- cannot confirm no orphan)"
+else
+	for m in $(printf '%s\n' "$ls_out" | awk '{print $1}' | grep -E "^${base}p[0-9]+$"); do
+		tbl_rc=0
+		seg="$(dmsetup table "$m" 2>/dev/null | awk '{print $3; exit}')" || tbl_rc=$?
+		if [ "$tbl_rc" != "0" ] || [ -z "${seg:-}" ]; then
+			live_orphan="UNKNOWN ($m table unreadable/empty -- fail closed)"
+		elif [ "$seg" != "error" ]; then
+			live_orphan="yes ($m -> $seg)"
+		fi
+	done
+fi
 echo "live (non-error) map still present: ${live_orphan}"
 
 # Prove the --force path actually ran: the map was held open (open_before > 0) so --retry

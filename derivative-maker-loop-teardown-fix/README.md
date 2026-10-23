@@ -3,8 +3,10 @@
 The build-side counterpart to this repo's upstream evidence. It shows, deterministically,
 how derivative-maker's `loop_teardown_verify()` behaves across four generations during a
 build's loop + kpartx-partition-map teardown, and that the final version tears the loop down
-on every case -- normal, kpartx false-positive, AND a persistent open count -- without ever
-orphaning a live map.
+whenever it SAFELY can -- normal, kpartx false-positive, AND a persistent open count -- and
+otherwise (the `--force` error target cannot neutralize the map, an unreadable `dmsetup ls`
+listing, an unreadable mount table, or a mounted map) FAILS LOUD with the loop still attached,
+never orphaning a live map and never destroying a map it cannot confirm is ours.
 
 ## The bug (old code)
 
@@ -16,8 +18,10 @@ no holder, unremovable even by `dmsetup remove --force/--retry/--deferred`.
 
 ## Generation 2 -- the maps-before-detach gate (commit 2c98f7dcb)
 
-Detach the loop only once no `${base}pN` map remains. No more orphan -- but it has NO way to
-clear a map `kpartx -d` refused to remove, so it loops all 5 attempts and FAILS the build.
+Detach the loop only once no `${base}pN` map remains. No orphan WHEN the listing succeeds --
+but its `dmsetup ls | grep` listing is FAIL-OPEN (an unreadable listing reads as "no maps" ->
+detach -> orphan; the robust version makes the listing fail-closed), AND it has NO way to clear
+a map `kpartx -d` refused to remove, so it loops all 5 attempts and FAILS the build.
 
 ## Generation 3 -- retry recovery (commit 0f459d4c)
 
@@ -52,15 +56,26 @@ losetup --detach "${loop_devices_item}"
 
 A surviving map with a LIVE (non-error) table is never detached (no orphan): the gate
 re-checks `dmsetup table` and leaves the loop attached to retry, failing loudly after 5 attempts.
-The function is FAIL-CLOSED, via helpers `dm_partition_maps` / `dm_map_neutralized` /
-`dm_map_mounted`: a failed `dmsetup ls` (its exit status is no longer swallowed) is treated as
-"maps may remain" (do not detach); a map is "neutralized" only if EVERY table segment is the
-error target; and `--force` is REFUSED on a MOUNTED map (error-targeting a live filesystem would
-corrupt it -- teardown runs after `help-steps/unmount-raw` unmounts, so a map at the force step
-is an unmounted gpt-auto open, not a mount). OWNERSHIP: `dm_partition_maps` emits a `${base}pN`
-map only when it is not CONFIRMED backed by a different block device (`dmsetup deps -o blkdevname`
-names this loop), so a coincidentally-named foreign map (e.g. one named `loop0p1` but backed by
-`/dev/sda1`) is never removed or allowed to gate the detach.
+The function is FAIL-CLOSED, via helpers `dm_partition_maps` / `dm_map_owned_by` /
+`dm_map_neutralized` / `dm_map_mounted`: a failed `dmsetup ls` (its exit status is no longer
+swallowed) is treated as "maps may remain" (do not detach); a map is "neutralized" only if EVERY
+table segment is the error target; and `--force` is REFUSED on a MOUNTED map. `dm_map_mounted`
+itself is fail-closed: it probes the whole mount table first (`findmnt --noheadings`), and an
+unreadable table (findmnt missing, `/proc` unreadable) reads as MOUNTED so `--force` never
+error-targets a live filesystem on a table it could not read.
+
+OWNERSHIP is a 3-WAY classifier on `dmsetup deps -o blkdevname` (which prints
+`N dependencies  : (<dev>)` -- the device name is taken from INSIDE the parentheses, so the
+literal word "dependencies" is never mistaken for a device):
+  - OWNED   -- deps resolvably name this loop -> removed (`--retry`/`--force`) and gates the detach.
+  - FOREIGN -- deps resolve to a NAMED other device (e.g. a map named `loop0p1` but backed by
+    `/dev/sda1`) -> OMITTED entirely: never removed, never gates our detach.
+  - UNKNOWN -- deps unreadable, empty, or only numeric `major, minor` (name unresolvable) -> GATES
+    the detach (it could be ours; never orphan it) but is NEVER removed (it could be foreign;
+    `dm_map_owned_by` restricts `--retry`/`--force` to OWNED maps). An unknown persistent-open map
+    makes teardown fail loud rather than destroy a map it cannot confirm is ours. (Earlier a
+    numeric-fallback deps string was misread as FOREIGN and DROPPED -> the owned map was neither
+    removed nor gated -> an orphan; UNKNOWN fixes that without destroying a genuinely-foreign map.)
 
 ## The proof
 
@@ -83,12 +98,19 @@ $ ./prove.sh
 === Scenario D: transient (kpartx -d wins after 2) ===  OLD orphans; NEW rc=0, loop freed
 === Scenario E: FAIL-CLOSED (dmsetup ls fails) ===  RETRY-ONLY fails open (orphan); NEW rc=1, no detach
 === Scenario F: REFUSE --force on a MOUNTED map ===  NEW rc=1, no detach (no corruption)
-RESULT: 13 passed, 0 failed
+=== Scenario G: OWNERSHIP -- FOREIGN map (backed by /dev/sda1) ===  NEW spares it + detaches, rc=0
+=== Scenario H: UNKNOWN deps (numeric, unresolvable) ===  NEW gates (not dropped/forced), rc=1, no orphan
+=== Scenario I: FAIL-CLOSED -- findmnt table unreadable ===  NEW refuses --force, rc=1, no orphan
+RESULT: 16 passed, 0 failed
 ```
 
 `prove.sh` exits non-zero if any case regresses: it is RED against OLD (orphan); scenario A is
-RED against GATE-ONLY and RETRY-ONLY (the build failure); and scenario E is RED against the
-fail-open `| grep || true` listing. If `new_*` ever regressed, the matching assertion flips to FAIL.
+RED against GATE-ONLY and RETRY-ONLY (the build failure); scenario E is RED against the
+fail-open `| grep || true` listing; scenario H is RED against a 2-way classifier that drops a
+numeric-deps map as foreign (orphan); and scenario I is RED against a `dm_map_mounted` that only
+runs `findmnt --source` (it would force on an unreadable table). If `new_*` ever regressed, the
+matching assertion flips to FAIL. The dist-ai suite (`loop_teardown_verify_test.sh`, 16 cases,
+sourcing the REAL production function) carries the same coverage as the authoritative regression.
 
 `recover-real.sh` validates the generation-4 LEVER on REAL device-mapper (needs root; run in the
 sandbox): it holds a kpartx partition map open, asserts the hold is real (open count > 0, else the
