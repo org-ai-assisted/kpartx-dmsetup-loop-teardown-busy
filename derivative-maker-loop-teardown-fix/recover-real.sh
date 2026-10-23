@@ -89,6 +89,10 @@ if [ "$ls_rc" != "0" ]; then
 	live_orphan="UNKNOWN (dmsetup ls failed rc=$ls_rc -- cannot confirm no orphan)"
 else
 	for m in $(printf '%s\n' "$ls_out" | awk '{print $1}' | grep -E "^${base}p[0-9]+$"); do
+		# Only an OWNED map is an orphan candidate -- a foreign map named ${base}pN (backed by a
+		# different device) is intentionally left alone by loop_teardown_verify, so ignore it here
+		# too. Reuse the sourced helper rather than re-deriving ownership.
+		dm_map_owned_by "$base" "$m" || continue
 		tbl_rc=0
 		seg="$(dmsetup table "$m" 2>/dev/null | awk '{print $3; exit}')" || tbl_rc=$?
 		if [ "$tbl_rc" != "0" ] || [ -z "${seg:-}" ]; then
